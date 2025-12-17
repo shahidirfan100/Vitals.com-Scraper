@@ -2,12 +2,13 @@
 // Priority order:
 // 1) JSON endpoint (Next.js `/_next/data/...` style) -> parse JSON
 // 2) Pure HTML (HTTP + JSON-LD/HTML parse)
-// 3) Browser bootstrap (Playwright) only when Cloudflare blocks HTTP (to refresh cookies/buildId)
+// Uses browser automation (Chromium) only as a last resort to obtain cookies + `__NEXT_DATA__.buildId`
+// for sites that require JavaScript / stricter anti-bot handling.
 import { Actor, log } from 'apify';
-import { Dataset, KeyValueStore } from 'crawlee';
+import { Dataset, KeyValueStore, PlaywrightCrawler } from 'crawlee';
 import { gotScraping } from 'got-scraping';
 import { load as cheerioLoad } from 'cheerio';
-import { firefox } from 'playwright';
+import { chromium } from 'playwright';
 
 const BASE_URL = 'https://www.vitals.com';
 const KV_KEY = 'VITALS_STATE_V1';
@@ -242,20 +243,6 @@ const buildListingUrl = ({ specialty, location, page = 1 }) => {
 
     if (page > 1) url += `?page=${page}`;
     return url;
-};
-
-const toPlaywrightProxy = (proxyUrl) => {
-    if (!proxyUrl) return undefined;
-    try {
-        const u = new URL(proxyUrl);
-        return {
-            server: `${u.protocol}//${u.hostname}:${u.port}`,
-            username: u.username ? decodeURIComponent(u.username) : undefined,
-            password: u.password ? decodeURIComponent(u.password) : undefined,
-        };
-    } catch {
-        return undefined;
-    }
 };
 
 // ============================================================================
@@ -601,7 +588,7 @@ const normalizeDoctorDetailsFromJson = (obj) => {
 };
 
 // ============================================================================
-// HTTP CLIENT (got-scraping) + Playwright bootstrap (only if blocked)
+// HTTP CLIENT (got-scraping)
 // ============================================================================
 
 const createHttpContext = ({ proxyConfiguration, persistState }) => {
@@ -616,19 +603,19 @@ const createHttpContext = ({ proxyConfiguration, persistState }) => {
         state.userAgent = pickRandom(USER_AGENTS);
     };
 
-    const getProxyUrl = () => {
+    const getProxyUrl = async () => {
         if (!proxyConfiguration?.newUrl) return undefined;
         try {
-            return proxyConfiguration.newUrl(state.sessionId);
+            return await proxyConfiguration.newUrl(state.sessionId);
         } catch {
-            return proxyConfiguration.newUrl();
+            return await proxyConfiguration.newUrl();
         }
     };
 
     const fetch = async ({ url, responseType = 'text', headers = {}, maxRetries = 3 }) => {
         let lastErr = null;
         for (let attempt = 1; attempt <= maxRetries; attempt++) {
-            const proxyUrl = getProxyUrl();
+            const proxyUrl = await getProxyUrl();
             const cookieHeader = cookieHeaderFromJar(state.cookieJar);
             const ua = state.userAgent || pickRandom(USER_AGENTS);
             const mergedHeaders = {
@@ -658,7 +645,7 @@ const createHttpContext = ({ proxyConfiguration, persistState }) => {
                 const body = res.body;
                 if (isProbablyBlocked({ statusCode: res.statusCode, body })) {
                     lastErr = new Error(`Blocked (${res.statusCode})`);
-                    if (attempt === Math.ceil(maxRetries / 2)) rotateSession();
+                    rotateSession();
                     await sleep(randomInt(800, 1600));
                     continue;
                 }
@@ -666,7 +653,7 @@ const createHttpContext = ({ proxyConfiguration, persistState }) => {
                 return { statusCode: res.statusCode, headers: res.headers, body, proxyUrlUsed: proxyUrl };
             } catch (err) {
                 lastErr = err;
-                if (attempt === Math.ceil(maxRetries / 2)) rotateSession();
+                rotateSession();
                 await sleep(randomInt(800, 1600));
             }
         }
@@ -676,57 +663,72 @@ const createHttpContext = ({ proxyConfiguration, persistState }) => {
     return { state, fetch, getProxyUrl };
 };
 
-const bootstrapWithPlaywright = async ({ url, httpContext, proxyUrl, hardTimeoutMs = 90000 }) => {
-    const ua = pickRandom(USER_AGENTS);
-    const proxy = toPlaywrightProxy(proxyUrl);
-    const start = Date.now();
+const bootstrapBuildIdAndCookies = async ({ url, proxyConfiguration, httpContext, stats }) => {
+    let buildId = null;
 
-    const browser = await firefox.launch({
-        headless: true,
-        proxy,
-        args: ['--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu', '--disable-extensions'],
+    const crawler = new PlaywrightCrawler({
+        proxyConfiguration,
+        maxConcurrency: 1,
+        maxRequestRetries: 1,
+        requestHandlerTimeoutSecs: 90,
+        navigationTimeoutSecs: 75,
+        launchContext: {
+            launcher: chromium,
+            launchOptions: {
+                headless: true,
+                args: ['--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu', '--disable-extensions'],
+            },
+        },
+        preNavigationHooks: [
+            async ({ page }) => {
+                await page.setViewportSize({
+                    width: 1920 + randomInt(-40, 40),
+                    height: 1080 + randomInt(-30, 30),
+                });
+                await page.addInitScript(() => {
+                    Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+                });
+                await page.route('**/*', (route) => {
+                    const type = route.request().resourceType();
+                    const rUrl = route.request().url();
+                    if (['image', 'font', 'media'].includes(type)) return route.abort();
+                    if (rUrl.includes('googletagmanager') || rUrl.includes('google-analytics') || rUrl.includes('doubleclick')) return route.abort();
+                    return route.continue();
+                });
+            },
+        ],
+        requestHandler: async ({ page, log: crawlerLog }) => {
+            await page.waitForLoadState('domcontentloaded', { timeout: 60000 });
+            await page.waitForTimeout(1500);
+
+            const html = await page.content();
+            if (isProbablyBlocked({ statusCode: 200, body: html })) {
+                throw new Error('Blocked page after browser navigation');
+            }
+
+            const nextData = extractNextDataFromHtml(html);
+            buildId = nextData?.buildId || null;
+            if (buildId) httpContext.state.buildId = buildId;
+
+            try {
+                httpContext.state.userAgent = await page.evaluate(() => navigator.userAgent);
+            } catch {
+                httpContext.state.userAgent = httpContext.state.userAgent || pickRandom(USER_AGENTS);
+            }
+
+            const cookies = await page.context().cookies();
+            for (const c of cookies) httpContext.state.cookieJar[c.name] = c.value;
+
+            crawlerLog.info(`Bootstrap complete: buildId=${buildId || 'n/a'} cookies=${cookies.length}`);
+        },
+        failedRequestHandler: async ({ error, log: crawlerLog }) => {
+            stats.errors++;
+            crawlerLog.warning(`Bootstrap failed: ${error.message}`);
+        },
     });
 
-    try {
-        const context = await browser.newContext({
-            userAgent: ua,
-            viewport: { width: 1920 + randomInt(-40, 40), height: 1080 + randomInt(-30, 30) },
-            locale: 'en-US',
-        });
-
-        await context.addInitScript(() => {
-            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-        });
-
-        const page = await context.newPage();
-        await page.route('**/*', (route) => {
-            const type = route.request().resourceType();
-            const rUrl = route.request().url();
-            if (['image', 'font', 'media'].includes(type)) return route.abort();
-            if (rUrl.includes('googletagmanager') || rUrl.includes('google-analytics') || rUrl.includes('doubleclick')) return route.abort();
-            return route.continue();
-        });
-
-        await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
-        await page.waitForTimeout(2000);
-
-        while (Date.now() - start < hardTimeoutMs) {
-            const content = await page.content();
-            if (!isProbablyBlocked({ statusCode: 200, body: content })) break;
-            await page.waitForTimeout(1500);
-        }
-
-        const cookies = await context.cookies();
-        for (const c of cookies) httpContext.state.cookieJar[c.name] = c.value;
-        httpContext.state.userAgent = await page.evaluate(() => navigator.userAgent);
-
-        const html = await page.content();
-        const nextData = extractNextDataFromHtml(html);
-        if (nextData?.buildId) httpContext.state.buildId = nextData.buildId;
-        return { html, buildId: httpContext.state.buildId, cookiesCount: cookies.length };
-    } finally {
-        await browser.close();
-    }
+    await crawler.run([{ url }]);
+    return buildId;
 };
 
 await Actor.init();
@@ -763,7 +765,6 @@ try {
         detailPages: 0,
         jsonPages: 0,
         htmlPages: 0,
-        playwrightBootstraps: 0,
         blocked: 0,
         errors: 0,
         saved: 0,
@@ -795,7 +796,7 @@ try {
             html = res.body;
         } catch (err) {
             stats.blocked++;
-            log.warning(`Seed HTML fetch blocked/failed, bootstrapping with browser: ${err.message}`);
+            log.warning(`Seed HTML fetch blocked/failed: ${err.message}`);
         }
 
         if (html) {
@@ -806,11 +807,20 @@ try {
             }
         }
 
-        stats.playwrightBootstraps++;
-        const proxyUrl = httpContext.getProxyUrl();
-        const boot = await bootstrapWithPlaywright({ url: seedUrl, httpContext, proxyUrl });
-        log.info(`Bootstrap: cookies=${boot.cookiesCount} buildId=${boot.buildId || 'n/a'}`);
-        return httpContext.state.buildId;
+        // Last resort: use a real browser (Chromium) once to obtain cookies + buildId.
+        try {
+            const built = await bootstrapBuildIdAndCookies({
+                url: seedUrl,
+                proxyConfiguration,
+                httpContext,
+                stats,
+            });
+            return built || httpContext.state.buildId || null;
+        } catch (err) {
+            stats.errors++;
+            log.warning(`Browser bootstrap failed: ${err.message}`);
+            return null;
+        }
     };
 
     const fetchListingDoctors = async (url) => {
@@ -852,22 +862,6 @@ try {
         } catch (err) {
             stats.blocked++;
             log.warning(`Listing HTML failed: ${url} (${err.message})`);
-        }
-
-        // 3) Browser fallback (only if JSON+HTML failed) - ensures we can handle client-rendered listings.
-        try {
-            stats.playwrightBootstraps++;
-            const proxyUrl = httpContext.getProxyUrl();
-            const boot = await bootstrapWithPlaywright({ url, httpContext, proxyUrl, hardTimeoutMs: 60000 });
-            const $ = cheerioLoad(boot.html);
-            const docs = extractDoctorsFromListingHtml($);
-            if (docs.length) {
-                stats.htmlPages++;
-                return docs;
-            }
-        } catch (err) {
-            stats.errors++;
-            log.warning(`Listing Playwright fallback failed: ${url} (${err.message})`);
         }
 
         return [];
@@ -992,49 +986,6 @@ try {
         } catch (err) {
             stats.errors++;
             log.warning(`Detail HTML failed: ${url} (${err.message})`);
-
-            // 3) Browser fallback only if HTTP is blocked/failed.
-            try {
-                stats.playwrightBootstraps++;
-                const proxyUrl = httpContext.getProxyUrl();
-                const boot = await bootstrapWithPlaywright({ url, httpContext, proxyUrl, hardTimeoutMs: 60000 });
-                const nextData = extractNextDataFromHtml(boot.html);
-                if (nextData?.buildId) httpContext.state.buildId = nextData.buildId;
-                const $ = cheerioLoad(boot.html);
-                const jsonLd = extractJsonLd($);
-                const html = extractDoctorFromHtml($);
-
-                const record = {
-                    id: url,
-                    doctorId: seed.doctorId || null,
-                    name: jsonLd?.name || html.name || seed.name || null,
-                    specialty: jsonLd?.specialty || html.specialty || seed.specialty || getSpecialtySlug(specialty),
-                    location:
-                        (jsonLd?.address?.city && jsonLd?.address?.state
-                            ? `${jsonLd.address.city}, ${jsonLd.address.state}`
-                            : null) ||
-                        seed.location ||
-                        location ||
-                        null,
-                    phone: jsonLd?.phone || html.phone || null,
-                    email: jsonLd?.email || html.email || null,
-                    website: html.website || null,
-                    rating: jsonLd?.rating != null ? Number(jsonLd.rating) : html.rating ?? seed.rating ?? null,
-                    reviews: jsonLd?.reviewCount != null ? Number(jsonLd.reviewCount) : seed.reviewCount ?? null,
-                    bio: jsonLd?.bio || html.bio || null,
-                    image: jsonLd?.image || html.image || null,
-                    address: jsonLd?.address || null,
-                    url,
-                    source: jsonLd ? 'json-ld+playwright' : 'html+playwright',
-                    fetched_at: new Date().toISOString(),
-                };
-
-                await Dataset.pushData(record);
-                stats.saved++;
-            } catch (pwErr) {
-                stats.errors++;
-                log.warning(`Detail Playwright fallback failed: ${url} (${pwErr.message})`);
-            }
         }
     };
 
@@ -1076,7 +1027,6 @@ try {
     log.info(`Saved: ${stats.saved}/${resultsWanted}`);
     log.info(`JSON pages parsed: ${stats.jsonPages}`);
     log.info(`HTML pages parsed: ${stats.htmlPages}`);
-    log.info(`Playwright bootstraps: ${stats.playwrightBootstraps}`);
     log.info(`Errors: ${stats.errors}`);
     log.info(`Runtime: ${totalTimeSec.toFixed(2)}s (${rate} rec/s)`);
     log.info('='.repeat(60));

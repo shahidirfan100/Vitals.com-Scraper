@@ -815,7 +815,11 @@ try {
     const isTimedOut = () => Date.now() - startTime > MAX_RUNTIME_MS;
 
     log.info('Vitals.com Physician Scraper');
-    log.info(`Search: specialty="${specialty}" slug="${getSpecialtySlug(specialty)}" location="${location}"`);
+    if (startUrl) {
+        log.info(`Search: startUrl="${String(startUrl)}"`);
+    } else {
+        log.info(`Search: specialty="${specialty}" slug="${getSpecialtySlug(specialty)}" location="${location}"`);
+    }
     log.info(
         `Target: ${resultsWanted} results, maxPages=${maxPages}, collectDetails=${collectDetails}, concurrency=${maxConcurrency}`,
     );

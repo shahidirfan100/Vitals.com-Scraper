@@ -2,6 +2,7 @@
 // Hybrid approach: PlaywrightCrawler for Cloudflare bypass + Multi-tier extraction
 import { Actor, log } from 'apify';
 import { PlaywrightCrawler, Dataset } from 'crawlee';
+import { firefox } from 'playwright';
 
 const BASE_URL = 'https://www.vitals.com';
 
@@ -70,8 +71,10 @@ const STATE_ABBREVIATIONS = {
  */
 const getSpecialtySlug = (specialty) => {
     if (!specialty) return 'doctors';
-    const normalized = specialty.toLowerCase().trim();
-    return SPECIALTY_SLUGS[normalized] || normalized.replace(/\s+/g, '-').replace(/[^a-z0-9-]/g, '');
+    // Normalize: lowercase, trim, replace hyphens with spaces for lookup
+    const normalized = specialty.toLowerCase().trim().replace(/-/g, ' ');
+    // Look up in mappings, fallback to hyphenated version of input
+    return SPECIALTY_SLUGS[normalized] || specialty.toLowerCase().trim().replace(/\s+/g, '-').replace(/[^a-z0-9-]/g, '');
 };
 
 /**
@@ -475,19 +478,28 @@ try {
     // Create Playwright crawler with stealth settings
     const crawler = new PlaywrightCrawler({
         proxyConfiguration,
-        maxConcurrency: Math.max(1, Math.min(maxConcurrency, 3)), // Cap at 3 for stealth
+        maxConcurrency: Math.max(1, Math.min(maxConcurrency, 2)), // Low concurrency for stealth
         maxRequestRetries: 3,
-        requestHandlerTimeoutSecs: 60,
-        navigationTimeoutSecs: 45,
+        requestHandlerTimeoutSecs: 90,
+        navigationTimeoutSecs: 60,
 
-        // Use Firefox for better Cloudflare bypass
-        headless: true,
+        // Use Firefox for better Cloudflare bypass with stealth mode
         launchContext: {
+            launcher: firefox,
+            stealth: true,
+            stealthOptions: {
+                addPlugins: true,
+                emulateWindowFrame: true,
+                mockDeviceMemory: true,
+                hideWebDriver: true,
+            },
             launchOptions: {
-                firefoxUserPrefs: {
-                    'dom.webdriver.enabled': false,
-                    'useAutomationExtension': false,
-                },
+                headless: true,
+                args: [
+                    '--no-sandbox',
+                    '--disable-dev-shm-usage',
+                    '--disable-gpu',
+                ],
             },
         },
 

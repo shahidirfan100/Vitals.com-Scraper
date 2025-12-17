@@ -385,6 +385,23 @@ const extractNextDataFromHtml = (html) => {
     return safeJsonParse(match[1].trim());
 };
 
+const extractNextBuildIdFromHtml = (html) => {
+    if (!html) return null;
+    const text = String(html);
+
+    const fromNextData = extractNextDataFromHtml(text);
+    if (fromNextData?.buildId) return String(fromNextData.buildId);
+
+    const m1 = text.match(/\/_next\/static\/([^/]+)\/_buildManifest\.js/i);
+    if (m1?.[1]) return m1[1];
+    const m2 = text.match(/\/_next\/static\/([^/]+)\/_ssgManifest\.js/i);
+    if (m2?.[1]) return m2[1];
+    const m3 = text.match(/\/_next\/static\/([^/]+)\/chunks\//i);
+    if (m3?.[1]) return m3[1];
+
+    return null;
+};
+
 const buildNextDataUrl = ({ buildId, pageUrl }) => {
     if (!buildId || !pageUrl) return null;
     const u = new URL(pageUrl);
@@ -612,7 +629,7 @@ const createHttpContext = ({ proxyConfiguration, persistState }) => {
         }
     };
 
-    const fetch = async ({ url, responseType = 'text', headers = {}, maxRetries = 3 }) => {
+    const fetch = async ({ url, responseType = 'text', headers = {}, maxRetries = 2, timeoutMs = 25000 }) => {
         let lastErr = null;
         for (let attempt = 1; attempt <= maxRetries; attempt++) {
             const proxyUrl = await getProxyUrl();
@@ -624,6 +641,7 @@ const createHttpContext = ({ proxyConfiguration, persistState }) => {
                 'cache-control': 'no-cache',
                 pragma: 'no-cache',
                 'user-agent': ua,
+                referer: `${BASE_URL}/`,
                 ...(cookieHeader ? { cookie: cookieHeader } : {}),
                 ...headers,
             };
@@ -635,7 +653,7 @@ const createHttpContext = ({ proxyConfiguration, persistState }) => {
                     responseType,
                     proxyUrl,
                     headers: mergedHeaders,
-                    timeout: { request: 45000 },
+                    timeout: { request: timeoutMs },
                     http2: true,
                     throwHttpErrors: false,
                     followRedirect: true,
@@ -646,7 +664,7 @@ const createHttpContext = ({ proxyConfiguration, persistState }) => {
                 if (isProbablyBlocked({ statusCode: res.statusCode, body })) {
                     lastErr = new Error(`Blocked (${res.statusCode})`);
                     rotateSession();
-                    await sleep(randomInt(800, 1600));
+                    await sleep(randomInt(250, 700));
                     continue;
                 }
 
@@ -654,7 +672,7 @@ const createHttpContext = ({ proxyConfiguration, persistState }) => {
             } catch (err) {
                 lastErr = err;
                 rotateSession();
-                await sleep(randomInt(800, 1600));
+                await sleep(randomInt(250, 700));
             }
         }
         throw lastErr || new Error('Request failed');
@@ -669,14 +687,26 @@ const bootstrapBuildIdAndCookies = async ({ url, proxyConfiguration, httpContext
     const crawler = new PlaywrightCrawler({
         proxyConfiguration,
         maxConcurrency: 1,
-        maxRequestRetries: 1,
-        requestHandlerTimeoutSecs: 90,
-        navigationTimeoutSecs: 75,
+        maxRequestRetries: 0,
+        requestHandlerTimeoutSecs: 45,
+        navigationTimeoutSecs: 35,
+        gotoOptions: { waitUntil: 'domcontentloaded' },
         launchContext: {
             launcher: chromium,
             launchOptions: {
                 headless: true,
                 args: ['--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu', '--disable-extensions'],
+            },
+        },
+        browserPoolOptions: {
+            maxOpenPagesPerBrowser: 1,
+            useFingerprints: true,
+            fingerprintOptions: {
+                fingerprintGeneratorOptions: {
+                    browsers: ['chrome'],
+                    operatingSystems: ['windows', 'macos'],
+                    locales: ['en-US'],
+                },
             },
         },
         preNavigationHooks: [
@@ -698,16 +728,29 @@ const bootstrapBuildIdAndCookies = async ({ url, proxyConfiguration, httpContext
             },
         ],
         requestHandler: async ({ page, log: crawlerLog }) => {
-            await page.waitForLoadState('domcontentloaded', { timeout: 60000 });
-            await page.waitForTimeout(1500);
+            await page.waitForTimeout(800);
 
-            const html = await page.content();
-            if (isProbablyBlocked({ statusCode: 200, body: html })) {
-                throw new Error('Blocked page after browser navigation');
+            let nextDataText = null;
+            try {
+                await page.waitForSelector('#__NEXT_DATA__', { timeout: 15000 });
+                nextDataText = await page.$eval('#__NEXT_DATA__', (el) => el.textContent || '');
+            } catch {
+                // continue to HTML fallback
             }
 
-            const nextData = extractNextDataFromHtml(html);
-            buildId = nextData?.buildId || null;
+            if (nextDataText) {
+                const nextData = safeJsonParse(nextDataText);
+                buildId = nextData?.buildId || null;
+            }
+
+            if (!buildId) {
+                const html = await page.content();
+                if (isProbablyBlocked({ statusCode: 200, body: html })) {
+                    throw new Error('Blocked page after browser navigation');
+                }
+                buildId = extractNextBuildIdFromHtml(html);
+            }
+
             if (buildId) httpContext.state.buildId = buildId;
 
             try {
@@ -786,73 +829,45 @@ try {
 
     const listingDoctors = [];
     const seenProfileUrls = new Set();
-
-    const ensureBuildId = async (seedUrl) => {
-        if (httpContext.state.buildId) return httpContext.state.buildId;
-
-        let html = null;
-        try {
-            const res = await httpContext.fetch({ url: seedUrl, responseType: 'text', maxRetries: 2 });
-            html = res.body;
-        } catch (err) {
-            stats.blocked++;
-            log.warning(`Seed HTML fetch blocked/failed: ${err.message}`);
-        }
-
-        if (html) {
-            const nextData = extractNextDataFromHtml(html);
-            if (nextData?.buildId) {
-                httpContext.state.buildId = nextData.buildId;
-                return httpContext.state.buildId;
-            }
-        }
-
-        // Last resort: use a real browser (Chromium) once to obtain cookies + buildId.
-        try {
-            const built = await bootstrapBuildIdAndCookies({
-                url: seedUrl,
-                proxyConfiguration,
-                httpContext,
-                stats,
-            });
-            return built || httpContext.state.buildId || null;
-        } catch (err) {
-            stats.errors++;
-            log.warning(`Browser bootstrap failed: ${err.message}`);
-            return null;
-        }
-    };
+    let browserBootstrapsUsed = 0;
+    const maxBrowserBootstraps = Number.isFinite(+input.maxBrowserBootstraps) ? Math.max(0, +input.maxBrowserBootstraps) : 1;
 
     const fetchListingDoctors = async (url) => {
         if (isTimedOut()) return [];
+        const existingBuildId = httpContext.state.buildId || null;
 
-        const buildId = await ensureBuildId(url);
-        const nextUrl = buildId ? buildNextDataUrl({ buildId, pageUrl: url }) : null;
-
-        if (nextUrl) {
-            try {
-                const res = await httpContext.fetch({
-                    url: nextUrl,
-                    responseType: 'text',
-                    headers: { accept: 'application/json,*/*;q=0.8' },
-                    maxRetries: 3,
-                });
-                const json = typeof res.body === 'string' ? safeJsonParse(res.body) : res.body;
-                const docs = json ? extractDoctorsFromNextData(json) : [];
-                if (docs.length) {
-                    stats.jsonPages++;
-                    return docs;
+        // 1) JSON-first only if we already know buildId (avoid expensive bootstraps).
+        if (existingBuildId) {
+            const nextUrl = buildNextDataUrl({ buildId: existingBuildId, pageUrl: url });
+            if (nextUrl) {
+                try {
+                    const res = await httpContext.fetch({
+                        url: nextUrl,
+                        responseType: 'text',
+                        headers: { accept: 'application/json,*/*;q=0.8' },
+                        maxRetries: 2,
+                        timeoutMs: 20000,
+                    });
+                    const json = typeof res.body === 'string' ? safeJsonParse(res.body) : res.body;
+                    const docs = json ? extractDoctorsFromNextData(json) : [];
+                    if (docs.length) {
+                        stats.jsonPages++;
+                        return docs;
+                    }
+                } catch (err) {
+                    stats.blocked++;
+                    log.debug(`Listing JSON failed: ${err.message}`);
                 }
-            } catch (err) {
-                stats.blocked++;
-                log.debug(`Listing JSON failed: ${err.message}`);
             }
         }
 
+        // 2) Pure HTML
+        let lastHtmlError = null;
         try {
-            const res = await httpContext.fetch({ url, responseType: 'text', maxRetries: 3 });
-            const nextData = extractNextDataFromHtml(res.body);
-            if (nextData?.buildId) httpContext.state.buildId = nextData.buildId;
+            const res = await httpContext.fetch({ url, responseType: 'text', maxRetries: 2, timeoutMs: 25000 });
+            const buildId = extractNextBuildIdFromHtml(res.body);
+            if (buildId) httpContext.state.buildId = buildId;
+
             const $ = cheerioLoad(res.body);
             const docs = extractDoctorsFromListingHtml($);
             if (docs.length) {
@@ -860,8 +875,31 @@ try {
                 return docs;
             }
         } catch (err) {
+            lastHtmlError = err;
             stats.blocked++;
             log.warning(`Listing HTML failed: ${url} (${err.message})`);
+        }
+
+        // 3) Browser bootstrap ONLY if HTML failed/empty and budget allows (keeps runs cheap/fast).
+        if (browserBootstrapsUsed < maxBrowserBootstraps && lastHtmlError) {
+            browserBootstrapsUsed++;
+            try {
+                await bootstrapBuildIdAndCookies({ url, proxyConfiguration, httpContext, stats });
+
+                const res = await httpContext.fetch({ url, responseType: 'text', maxRetries: 2, timeoutMs: 25000 });
+                const buildId = extractNextBuildIdFromHtml(res.body);
+                if (buildId) httpContext.state.buildId = buildId;
+
+                const $ = cheerioLoad(res.body);
+                const docs = extractDoctorsFromListingHtml($);
+                if (docs.length) {
+                    stats.htmlPages++;
+                    return docs;
+                }
+            } catch (err) {
+                stats.errors++;
+                log.warning(`Browser bootstrap (listing) failed: ${err.message}`);
+            }
         }
 
         return [];
@@ -883,7 +921,7 @@ try {
             if (listingDoctors.length >= resultsWanted) break;
         }
 
-        await sleep(randomInt(200, 600));
+        await sleep(randomInt(80, 200));
     }
 
     if (!listingDoctors.length) {
@@ -908,7 +946,8 @@ try {
                     url: nextUrl,
                     responseType: 'text',
                     headers: { accept: 'application/json,*/*;q=0.8' },
-                    maxRetries: 3,
+                    maxRetries: 2,
+                    timeoutMs: 20000,
                 });
                 const json = typeof res.body === 'string' ? safeJsonParse(res.body) : res.body;
                 if (json) {
@@ -950,9 +989,9 @@ try {
         }
 
         try {
-            const res = await httpContext.fetch({ url, responseType: 'text', maxRetries: 3 });
-            const nextData = extractNextDataFromHtml(res.body);
-            if (nextData?.buildId) httpContext.state.buildId = nextData.buildId;
+            const res = await httpContext.fetch({ url, responseType: 'text', maxRetries: 2, timeoutMs: 25000 });
+            const buildIdFromHtml = extractNextBuildIdFromHtml(res.body);
+            if (buildIdFromHtml) httpContext.state.buildId = buildIdFromHtml;
             const $ = cheerioLoad(res.body);
             const jsonLd = extractJsonLd($);
             const html = extractDoctorFromHtml($);
@@ -1005,7 +1044,7 @@ try {
                 let p;
                 p = (async () => processOneDetail(item))().finally(() => inFlight.delete(p));
                 inFlight.add(p);
-                await sleep(randomInt(80, 200));
+                await sleep(randomInt(20, 80));
             }
             if (!inFlight.size) break;
             await Promise.race(inFlight);

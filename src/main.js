@@ -66,18 +66,36 @@ const createLimiter = (maxConcurrency) => {
 };
 
 const buildSearchUrl = ({ specialty, location, insurance, page = 1 }) => {
-    // Try multiple URL formats for better compatibility
+    // Vitals.com uses path-based URLs, not query parameters
+    // Format: /search/{specialty-slug}/{location-slug}
+    
+    const specialtySlug = specialty ? specialty.toLowerCase().replace(/\s+/g, '-').replace(/[^a-z0-9-]/g, '') : '';
+    const locationSlug = location ? location.toLowerCase().replace(/\s+/g, '-').replace(/[^a-z0-9-]/g, '') : '';
+    
+    // Try different URL formats
     let searchUrl;
     
-    // Format 1: Modern search endpoint
-    const u = new URL('https://www.vitals.com/doctors');
-    if (specialty) u.searchParams.set('specialty', specialty);
-    if (location) u.searchParams.set('location', location);
-    if (insurance) u.searchParams.set('insurance', insurance);
-    u.searchParams.set('page', String(page));
+    if (page === 1) {
+        // First page - try simple format
+        if (specialtySlug && locationSlug) {
+            searchUrl = `https://www.vitals.com/search/${specialtySlug}/${locationSlug}`;
+        } else if (specialtySlug) {
+            searchUrl = `https://www.vitals.com/${specialtySlug}`;
+        } else {
+            searchUrl = `https://www.vitals.com/doctors`;
+        }
+    } else {
+        // Pagination - add page number
+        if (specialtySlug && locationSlug) {
+            searchUrl = `https://www.vitals.com/search/${specialtySlug}/${locationSlug}?page=${page}`;
+        } else if (specialtySlug) {
+            searchUrl = `https://www.vitals.com/${specialtySlug}?page=${page}`;
+        } else {
+            searchUrl = `https://www.vitals.com/doctors?page=${page}`;
+        }
+    }
     
-    searchUrl = u.href;
-    log.debug(`Built search URL: ${searchUrl}`);
+    log.info(`Built search URL: ${searchUrl}`);
     return searchUrl;
 };
 
@@ -277,8 +295,17 @@ const fetchSearchPage = async (params, pageNumber, proxyConfiguration) => {
             return { physicians: [], hasMore: false };
         }
 
-        // Log first 500 chars for debugging
-        log.debug(`Response preview: ${res.body.substring(0, 500)}`);
+        // Log response info for debugging
+        log.info(`Response size: ${res.body.length} bytes, status: ${res.statusCode}`);
+        
+        // Check for common error pages or redirects
+        if (res.body.includes('404') || res.body.includes('Not Found') || res.body.includes('Page not found')) {
+            log.warning(`Page ${pageNumber} appears to be 404/Not Found`);
+        }
+        
+        // Count doctor links for debugging
+        const doctorLinksCount = (res.body.match(/href="[^"]*\/doctors\/[^"]*"/g) || []).length;
+        log.info(`Found ${doctorLinksCount} doctor profile links in HTML`);
 
         const physicians = parsePhysiciansPage(res.body, searchUrl);
         const $ = cheerioLoad(res.body);

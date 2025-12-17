@@ -3,9 +3,9 @@
   "location": "United States",
   "insurance": "",
   "results_wanted": 50,
-  "max_pages": 5,
+  "max_pages": 10,
   "collectDetails": true,
-  "maxConcurrency": 5,
+  "maxConcurrency": 10,
   "proxyConfiguration": {
     "useApifyProxy": true
   }

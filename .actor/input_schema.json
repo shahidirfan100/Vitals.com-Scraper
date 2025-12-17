@@ -25,6 +25,8 @@
       "type": "string",
       "description": "State, city, or region to search (e.g., New York, California, Los Angeles).",
       "editor": "textfield",
+      "default": "",
+      "prefill": "",
       "example": "New York"
     },
     "insurance": {
@@ -59,8 +61,8 @@
       "minimum": 1,
       "maximum": 20,
       "editor": "number",
-      "default": 3,
-      "prefill": 3
+      "default": 10,
+      "prefill": 10
     },
     "maxConcurrency": {
       "title": "Max Concurrent Requests",
@@ -68,8 +70,8 @@
       "description": "Number of parallel requests (1-10). Balance speed vs. reliability.",
       "minimum": 1,
       "maximum": 10,
-      "default": 3,
-      "prefill": 3,
+      "default": 10,
+      "prefill": 10,
       "editor": "number"
     },
     "proxyConfiguration": {

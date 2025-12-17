@@ -779,7 +779,7 @@ try {
     const input = (await Actor.getInput()) || {};
     const {
         specialty = 'Cardiovascular Disease',
-        location = 'New York, NY',
+        location: locationRaw = '',
         startUrl,
         collectDetails = true,
         results_wanted: resultsWantedRaw = 50,
@@ -789,8 +789,9 @@ try {
     } = input;
 
     const resultsWanted = Number.isFinite(+resultsWantedRaw) ? Math.max(1, +resultsWantedRaw) : 50;
-    const maxPages = Number.isFinite(+maxPagesRaw) ? Math.max(1, +maxPagesRaw) : 5;
-    const maxConcurrency = Number.isFinite(+maxConcurrencyRaw) ? Math.min(10, Math.max(1, +maxConcurrencyRaw)) : 5;
+    const maxPages = Number.isFinite(+maxPagesRaw) ? Math.max(1, +maxPagesRaw) : 10;
+    const maxConcurrency = Number.isFinite(+maxConcurrencyRaw) ? Math.min(10, Math.max(1, +maxConcurrencyRaw)) : 10;
+    const location = cleanText(locationRaw);
 
     const proxyConfiguration = proxyConfig
         ? await Actor.createProxyConfiguration(proxyConfig)
@@ -818,7 +819,8 @@ try {
     if (startUrl) {
         log.info(`Search: startUrl="${String(startUrl)}"`);
     } else {
-        log.info(`Search: specialty="${specialty}" slug="${getSpecialtySlug(specialty)}" location="${location}"`);
+        const base = `Search: specialty="${specialty}" slug="${getSpecialtySlug(specialty)}"`;
+        log.info(location ? `${base} location="${location}"` : base);
     }
     log.info(
         `Target: ${resultsWanted} results, maxPages=${maxPages}, collectDetails=${collectDetails}, concurrency=${maxConcurrency}`,

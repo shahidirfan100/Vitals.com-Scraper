@@ -66,12 +66,19 @@ const createLimiter = (maxConcurrency) => {
 };
 
 const buildSearchUrl = ({ specialty, location, insurance, page = 1 }) => {
-    const u = new URL(SEARCH_PAGE_BASE);
+    // Try multiple URL formats for better compatibility
+    let searchUrl;
+    
+    // Format 1: Modern search endpoint
+    const u = new URL('https://www.vitals.com/doctors');
     if (specialty) u.searchParams.set('specialty', specialty);
     if (location) u.searchParams.set('location', location);
     if (insurance) u.searchParams.set('insurance', insurance);
     u.searchParams.set('page', String(page));
-    return u.href;
+    
+    searchUrl = u.href;
+    log.debug(`Built search URL: ${searchUrl}`);
+    return searchUrl;
 };
 
 const pickProxyUrl = async (proxyConfiguration) => (proxyConfiguration ? proxyConfiguration.newUrl() : undefined);
@@ -103,48 +110,121 @@ const parsePhysiciansPage = (html, pageUrl) => {
     const $ = cheerioLoad(html);
     const physicians = [];
 
-    // Primary selector: physician cards/listings
+    // Method 1: Try common card selectors
     const selectors = [
         '[data-testid*="doctor"]',
+        '[data-testid*="provider"]',
         '.doctor-card',
         '.provider-card',
         '.physician-listing',
         '[class*="DoctorCard"]',
         '[class*="PhysicianCard"]',
+        '[class*="ProviderCard"]',
+        'article',
+        'div[role="listitem"]',
     ];
 
     let cardElements = [];
+    let foundSelector = null;
     for (const selector of selectors) {
-        cardElements = $(selector).get();
-        if (cardElements.length > 0) {
-            log.debug(`Found ${cardElements.length} cards using selector: ${selector}`);
+        const elements = $(selector).get();
+        if (elements.length > 0) {
+            cardElements = elements;
+            foundSelector = selector;
+            log.debug(`Found ${elements.length} cards using selector: ${selector}`);
             break;
         }
     }
 
+    // Method 2: If no cards found, extract from all links to doctor profiles
     if (cardElements.length === 0) {
-        // Fallback: look for links to doctor profiles
-        cardElements = $('a[href*="/doctors/"]').parent().get();
+        log.debug(`No card elements found, extracting from doctor profile links...`);
+        const doctorLinks = $('a[href*="/doctors/"]').get();
+        log.debug(`Found ${doctorLinks.length} doctor profile links`);
+        
+        if (doctorLinks.length > 0) {
+            // Group links by parent container for better data extraction
+            const seenUrls = new Set();
+            doctorLinks.forEach((linkEl) => {
+                try {
+                    const href = $(linkEl).attr('href');
+                    if (!href || seenUrls.has(href)) return;
+                    seenUrls.add(href);
+
+                    const fullUrl = new URL(href, BASE_URL).href;
+                    const name = $(linkEl).text().trim();
+                    
+                    if (name && name.length > 2) {
+                        // Look for parent container with more info
+                        const $parent = $(linkEl).closest('div, section, article, li');
+                        const specialty = $parent.find('[class*="specialty"], [class*="specialization"]').text().trim();
+                        const location = $parent.find('[class*="location"], [class*="city"], [class*="address"]').text().trim();
+                        const ratingText = $parent.find('[class*="rating"], [class*="score"], [class*="stars"]').text();
+                        const rating = ratingText.match(/[\d.]+/)?.[0];
+
+                        physicians.push({
+                            id: fullUrl,
+                            name,
+                            specialty: specialty || null,
+                            location: location || null,
+                            phone: null,
+                            rating: rating ? parseFloat(rating) : null,
+                            url: fullUrl,
+                            source: 'html-search',
+                            fetched_at: new Date().toISOString(),
+                        });
+                    }
+                } catch (err) {
+                    log.debug(`Error processing doctor link: ${err.message}`);
+                }
+            });
+            return physicians;
+        }
     }
 
+    // Method 3: Process card elements
     cardElements.slice(0, 50).forEach((el) => {
         try {
             const $card = $(el);
-            const profileLink = $card.find('a[href*="/doctors/"]').attr('href') || 
-                               $card.attr('href') || 
-                               $card.find('a').first().attr('href');
+            
+            // Try to find doctor profile link within card
+            const $link = $card.find('a[href*="/doctors/"]').first();
+            let profileLink = $link.attr('href');
+            let name = $link.text().trim();
+
+            // If no link found, try broader approach
+            if (!profileLink) {
+                profileLink = $card.find('a').first().attr('href');
+                if (!profileLink || !profileLink.includes('/doctors/')) {
+                    // Last resort: extract from any a tag
+                    const allLinks = $card.find('a').get();
+                    for (const link of allLinks) {
+                        const href = $(link).attr('href');
+                        if (href && href.includes('/doctors/')) {
+                            profileLink = href;
+                            name = $(link).text().trim();
+                            break;
+                        }
+                    }
+                }
+            }
             
             if (!profileLink || !profileLink.includes('/doctors/')) return;
 
             const fullUrl = new URL(profileLink, BASE_URL).href;
-            const name = $card.find('[class*="name"], h2, h3, .title').first().text().trim() ||
-                        $card.find('a[href*="/doctors/"]').first().text().trim();
-            const specialty = $card.find('[class*="specialty"], [class*="specialization"]').first().text().trim();
-            const location = $card.find('[class*="location"], [class*="city"]').first().text().trim();
-            const rating = $card.find('[class*="rating"], [class*="score"]').first().text().match(/[\d.]+/)?.[0];
+            
+            // Extract name if not already found
+            if (!name) {
+                name = $card.find('h1, h2, h3, h4, [class*="name"], [class*="title"]').first().text().trim();
+            }
+
+            const specialty = $card.find('[class*="specialty"], [class*="specialization"], span').first().text().trim();
+            const location = $card.find('[class*="location"], [class*="city"], [class*="address"]').text().trim();
+            const ratingText = $card.find('[class*="rating"], [class*="score"], [class*="stars"]').text();
+            const rating = ratingText.match(/[\d.]+/)?.[0];
             const phone = $card.find('a[href^="tel:"]').attr('href')?.replace('tel:', '').trim();
 
-            if (name) {
+            if (name && name.length > 2) {
                 physicians.push({
                     id: fullUrl,
                     name,
@@ -162,6 +242,7 @@ const parsePhysiciansPage = (html, pageUrl) => {
         }
     });
 
+    log.info(`parsePhysiciansPage: Extracted ${physicians.length} physicians (selector: ${foundSelector || 'links'})`);
     return physicians;
 };
 
@@ -174,7 +255,7 @@ const fetchSearchPage = async (params, pageNumber, proxyConfiguration) => {
             page: pageNumber 
         });
 
-        log.debug(`Fetching search page ${pageNumber}: ${searchUrl}`);
+        log.info(`Fetching: ${searchUrl}`);
 
         const res = await fetchWithRetry({
             url: searchUrl,
@@ -190,12 +271,26 @@ const fetchSearchPage = async (params, pageNumber, proxyConfiguration) => {
             return { physicians: [], hasMore: false };
         }
 
+        // Check if HTML content is valid and contains doctor links
+        if (!res.body || res.body.length < 1000) {
+            log.warning(`Page ${pageNumber} returned minimal content (${res.body?.length || 0} bytes)`);
+            return { physicians: [], hasMore: false };
+        }
+
+        // Log first 500 chars for debugging
+        log.debug(`Response preview: ${res.body.substring(0, 500)}`);
+
         const physicians = parsePhysiciansPage(res.body, searchUrl);
         const $ = cheerioLoad(res.body);
+        
+        // Check for pagination indicators
         const hasNextPage = $('a[rel="next"]').length > 0 || 
                            $('a:contains("Next")').length > 0 ||
-                           physicians.length >= 20;
+                           $('a[href*="page="]').length > 0 ||
+                           physicians.length >= 15; // If we got significant results, assume more pages
 
+        log.info(`Page ${pageNumber}: Got ${physicians.length} physicians, hasMore: ${hasNextPage}`);
+        
         return { physicians, hasMore: hasNextPage };
     } catch (err) {
         log.error(`Failed to fetch search page ${pageNumber}: ${err.message}`);
@@ -336,7 +431,7 @@ try {
         }
 
         try {
-            log.info(`📄 Fetching page ${pageNumber}...`);
+            log.info(`📄 Fetching page ${pageNumber}/${maxPages}...`);
             const { physicians, hasMore } = await fetchSearchPage(
                 { specialty: specialtyValue, location: locationValue, insurance },
                 pageNumber,
@@ -345,12 +440,32 @@ try {
             stats.totalApiCalls += 1;
             stats.pagesProcessed = pageNumber;
 
+            log.info(`Received ${physicians.length} physicians from page ${pageNumber}`);
+
             if (!physicians || physicians.length === 0) {
-                log.info(`✅ No more results on page ${pageNumber}. Stopping pagination.`);
-                break;
+                if (pageNumber === 1) {
+                    log.warning(`⚠️  First page returned 0 results. Retrying with different approach...`);
+                    // Try one more time on first page
+                    const retry = await fetchSearchPage(
+                        { specialty: specialtyValue, location: locationValue, insurance },
+                        pageNumber,
+                        proxyConf
+                    );
+                    if (retry.physicians.length === 0) {
+                        log.error(`❌ Search returned no results after retry. This suggests the search URL or selectors need updating.`);
+                        break;
+                    } else {
+                        physicians.push(...retry.physicians);
+                    }
+                } else {
+                    log.info(`✅ No more results on page ${pageNumber}. Stopping pagination.`);
+                    break;
+                }
             }
 
-            log.info(`✅ Page ${pageNumber}: Found ${physicians.length} physicians (total: ${saved}/${resultsWanted})`);
+            if (physicians.length === 0) break;
+
+            log.info(`✅ Page ${pageNumber}: Found ${physicians.length} physicians (total saved: ${saved}/${resultsWanted})`);
 
             // Parallel detail fetching with concurrency limiter
             const remaining = resultsWanted - saved;

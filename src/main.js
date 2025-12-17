@@ -783,8 +783,8 @@ try {
         startUrl,
         collectDetails = true,
         results_wanted: resultsWantedRaw = 50,
-        max_pages: maxPagesRaw = 5,
-        maxConcurrency: maxConcurrencyRaw = 5,
+        max_pages: maxPagesRaw = 10,
+        maxConcurrency: maxConcurrencyRaw = 10,
         proxyConfiguration: proxyConfig,
     } = input;
 

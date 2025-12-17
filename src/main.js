@@ -81,25 +81,42 @@ const parseLocation = (location) => {
     if (!location) return null;
     const normalized = location.toLowerCase().trim();
 
-    // Check if it's a state name or contains state info
-    for (const [stateName, abbrev] of Object.entries(STATE_ABBREVIATIONS)) {
-        if (normalized.includes(stateName) || normalized === abbrev) {
-            // Extract city if present
-            const cityMatch = normalized.replace(stateName, '').replace(abbrev, '').trim();
-            const city = cityMatch ? cityMatch.replace(/[,\s]+/g, '-').replace(/[^a-z0-9-]/g, '') : null;
-            return { state: abbrev, city };
+    // Priority 1: Try to parse "City, State" or "City, ST" format
+    if (normalized.includes(',')) {
+        const [cityPart, statePart] = normalized.split(',').map(s => s.trim());
+        if (cityPart && statePart) {
+            // Check if statePart is a state abbreviation or full name
+            const stateAbbrev = statePart.length === 2
+                ? statePart
+                : STATE_ABBREVIATIONS[statePart];
+            if (stateAbbrev) {
+                const city = cityPart.replace(/\s+/g, '-').replace(/[^a-z0-9-]/g, '');
+                return { state: stateAbbrev, city: city || null };
+            }
         }
     }
 
-    // Try to parse "City, State" format
-    const parts = normalized.split(/[,\s]+/);
+    // Priority 2: Try "City State" or "City ST" (space-separated)
+    const parts = normalized.split(/\s+/);
     if (parts.length >= 2) {
         const lastPart = parts[parts.length - 1];
-        const stateAbbrev = STATE_ABBREVIATIONS[lastPart] || (lastPart.length === 2 ? lastPart : null);
+        const stateAbbrev = lastPart.length === 2
+            ? lastPart
+            : STATE_ABBREVIATIONS[lastPart];
         if (stateAbbrev) {
             const city = parts.slice(0, -1).join('-').replace(/[^a-z0-9-]/g, '');
-            return { state: stateAbbrev, city };
+            return { state: stateAbbrev, city: city || null };
         }
+    }
+
+    // Priority 3: Check if entire string is a state name
+    if (STATE_ABBREVIATIONS[normalized]) {
+        return { state: STATE_ABBREVIATIONS[normalized], city: null };
+    }
+
+    // Priority 4: Check if it's just a state abbreviation
+    if (normalized.length === 2 && Object.values(STATE_ABBREVIATIONS).includes(normalized)) {
+        return { state: normalized, city: null };
     }
 
     return null;
@@ -113,7 +130,10 @@ const buildListingUrl = ({ specialty, location, page = 1 }) => {
     const locationInfo = parseLocation(location);
 
     let url;
-    if (locationInfo?.state && locationInfo?.city) {
+    // Validate city is not empty or just hyphens/dashes
+    const validCity = locationInfo?.city && locationInfo.city.replace(/-/g, '').length > 0;
+
+    if (locationInfo?.state && validCity) {
         url = `${BASE_URL}/${specialtySlug}/${locationInfo.state}/${locationInfo.city}`;
     } else if (locationInfo?.state) {
         url = `${BASE_URL}/${specialtySlug}/${locationInfo.state}`;
@@ -461,15 +481,17 @@ try {
         navigationTimeoutSecs: 45,
 
         // Use Firefox for better Cloudflare bypass
+        headless: true,
         launchContext: {
-            launcher: 'firefox',
             launchOptions: {
-                headless: true,
-                args: ['--disable-blink-features=AutomationControlled'],
+                firefoxUserPrefs: {
+                    'dom.webdriver.enabled': false,
+                    'useAutomationExtension': false,
+                },
             },
         },
 
-        // Browser pool settings
+        // Browser pool settings for Firefox
         browserPoolOptions: {
             useFingerprints: true,
             fingerprintOptions: {

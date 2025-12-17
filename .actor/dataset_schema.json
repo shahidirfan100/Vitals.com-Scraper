@@ -1,0 +1,100 @@
+{
+  "actorSpecification": 1,
+  "fields": {},
+  "views": {
+    "overview": {
+      "title": "Overview",
+      "transformation": {
+        "fields": [
+          "name",
+          "specialty",
+          "location",
+          "phone",
+          "rating",
+          "reviews",
+          "experience",
+          "url"
+        ]
+      },
+      "display": {
+        "component": "table",
+        "properties": {
+          "name": {
+            "label": "Physician Name",
+            "format": "text"
+          },
+          "specialty": {
+            "label": "Specialty",
+            "format": "text"
+          },
+          "location": {
+            "label": "Location",
+            "format": "text"
+          },
+          "phone": {
+            "label": "Phone",
+            "format": "text"
+          },
+          "rating": {
+            "label": "Rating",
+            "format": "number"
+          },
+          "reviews": {
+            "label": "Reviews",
+            "format": "number"
+          },
+          "experience": {
+            "label": "Years Experience",
+            "format": "number"
+          },
+          "url": {
+            "label": "Vitals Profile",
+            "format": "link"
+          }
+        }
+      }
+    },
+    "credentials": {
+      "title": "Credentials & Details",
+      "transformation": {
+        "fields": [
+          "name",
+          "specialty",
+          "education",
+          "certifications",
+          "accepted_insurance",
+          "bio"
+        ]
+      },
+      "display": {
+        "component": "table",
+        "properties": {
+          "name": {
+            "label": "Physician",
+            "format": "text"
+          },
+          "specialty": {
+            "label": "Specialty",
+            "format": "text"
+          },
+          "education": {
+            "label": "Education",
+            "format": "text"
+          },
+          "certifications": {
+            "label": "Certifications",
+            "format": "text"
+          },
+          "accepted_insurance": {
+            "label": "Insurance",
+            "format": "text"
+          },
+          "bio": {
+            "label": "Biography",
+            "format": "text"
+          }
+        }
+      }
+    }
+  }
+}

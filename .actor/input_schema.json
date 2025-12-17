@@ -1,0 +1,95 @@
+{
+  "title": "Vitals.com Physician Scraper",
+  "description": "Extract comprehensive physician profiles and ratings from Vitals.com. Search by specialty, location, and insurance preferences.",
+  "type": "object",
+  "schemaVersion": 1,
+  "properties": {
+    "startUrl": {
+      "title": "Start URL",
+      "type": "string",
+      "description": "Direct Vitals.com search URL. If set, overrides specialty/location/insurance parameters.",
+      "editor": "textfield",
+      "example": "https://www.vitals.com/doctors?specialty=Cardiologist&location=New York"
+    },
+    "specialty": {
+      "title": "Medical Specialty",
+      "type": "string",
+      "description": "Medical specialty or field (e.g., Cardiology, Dermatology, Psychiatry).",
+      "editor": "textfield",
+      "prefill": "Cardiovascular Disease",
+      "default": "Cardiovascular Disease",
+      "example": "Cardiology"
+    },
+    "location": {
+      "title": "Geographic Location",
+      "type": "string",
+      "description": "State, city, or region to search (e.g., New York, California, Los Angeles).",
+      "editor": "textfield",
+      "example": "New York"
+    },
+    "insurance": {
+      "title": "Insurance Provider",
+      "type": "string",
+      "description": "Filter by accepted insurance (e.g., Aetna, Blue Cross, Cigna, Medicare).",
+      "editor": "textfield",
+      "example": "Aetna"
+    },
+    "collectDetails": {
+      "title": "Collect Full Physician Profiles",
+      "type": "boolean",
+      "description": "Extract complete physician details including education, certifications, and full biography.",
+      "editor": "checkbox",
+      "default": true,
+      "prefill": true
+    },
+    "results_wanted": {
+      "title": "Maximum Physicians to Extract",
+      "type": "integer",
+      "description": "Target number of physician profiles (1-500).",
+      "minimum": 1,
+      "maximum": 500,
+      "default": 50,
+      "prefill": 50,
+      "editor": "number"
+    },
+    "max_pages": {
+      "title": "Maximum Pages",
+      "type": "integer",
+      "description": "Maximum number of search result pages to process.",
+      "minimum": 1,
+      "maximum": 20,
+      "editor": "number",
+      "default": 3,
+      "prefill": 3
+    },
+    "maxConcurrency": {
+      "title": "Max Concurrent Requests",
+      "type": "integer",
+      "description": "Number of parallel requests (1-10). Balance speed vs. reliability.",
+      "minimum": 1,
+      "maximum": 10,
+      "default": 3,
+      "prefill": 3,
+      "editor": "number"
+    },
+    "proxyConfiguration": {
+      "title": "Proxy Configuration",
+      "type": "object",
+      "description": "Apify Proxy for enhanced reliability. Residential proxy recommended for best results.",
+      "editor": "proxy",
+      "default": {
+        "useApifyProxy": true,
+        "apifyProxyGroups": [
+          "RESIDENTIAL"
+        ]
+      },
+      "prefill": {
+        "useApifyProxy": true,
+        "apifyProxyGroups": [
+          "RESIDENTIAL"
+        ]
+      }
+    }
+  },
+  "required": []
+}

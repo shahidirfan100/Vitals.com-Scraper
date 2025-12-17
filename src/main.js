@@ -1,93 +1,202 @@
-// Vitals.com Physician Scraper - Production Ready, Fast & Stealthy
-// Hybrid approach: Playwright Firefox for listings + got-scraping/Cheerio for details
+// Vitals.com Physician Scraper - JSON API first, HTML fallback, stealthy + fast.
+// Priority order:
+// 1) JSON endpoint (Next.js `/_next/data/...` style) -> parse JSON
+// 2) Pure HTML (HTTP + JSON-LD/HTML parse)
+// 3) Browser bootstrap (Playwright) only when Cloudflare blocks HTTP (to refresh cookies/buildId)
 import { Actor, log } from 'apify';
-import { PlaywrightCrawler, Dataset, KeyValueStore } from 'crawlee';
-import { firefox } from 'playwright';
+import { Dataset, KeyValueStore } from 'crawlee';
 import { gotScraping } from 'got-scraping';
 import { load as cheerioLoad } from 'cheerio';
+import { firefox } from 'playwright';
 
 const BASE_URL = 'https://www.vitals.com';
-const SESSION_KEY = 'VITALS_SESSION';
+const KV_KEY = 'VITALS_STATE_V1';
 
-// ============================================================================
-// SPECIALTY & LOCATION MAPPINGS
-// ============================================================================
+const USER_AGENTS = [
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:127.0) Gecko/20100101 Firefox/127.0',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 14.5; rv:127.0) Gecko/20100101 Firefox/127.0',
+];
 
 const SPECIALTY_SLUGS = {
     'cardiovascular disease': 'cardiologists',
-    'cardiology': 'cardiologists',
-    'cardiologist': 'cardiologists',
-    'dermatology': 'dermatologists',
-    'dermatologist': 'dermatologists',
+    cardiology: 'cardiologists',
+    cardiologist: 'cardiologists',
+    dermatology: 'dermatologists',
+    dermatologist: 'dermatologists',
     'family medicine': 'family-medicine-doctors',
     'family practice': 'family-medicine-doctors',
     'internal medicine': 'internists',
-    'internist': 'internists',
+    internist: 'internists',
     'orthopedic surgery': 'orthopedic-surgeons',
-    'orthopedics': 'orthopedic-surgeons',
-    'pediatrics': 'pediatricians',
-    'pediatrician': 'pediatricians',
-    'psychiatry': 'psychiatrists',
-    'psychiatrist': 'psychiatrists',
-    'neurology': 'neurologists',
-    'neurologist': 'neurologists',
+    orthopedics: 'orthopedic-surgeons',
+    pediatrics: 'pediatricians',
+    pediatrician: 'pediatricians',
+    psychiatry: 'psychiatrists',
+    psychiatrist: 'psychiatrists',
+    neurology: 'neurologists',
+    neurologist: 'neurologists',
     'obstetrics gynecology': 'obstetricians-gynecologists',
     'ob-gyn': 'obstetricians-gynecologists',
-    'ophthalmology': 'ophthalmologists',
-    'ophthalmologist': 'ophthalmologists',
-    'dentist': 'dentists',
-    'dentistry': 'dentists',
-    'gastroenterology': 'gastroenterologists',
-    'gastroenterologist': 'gastroenterologists',
-    'urology': 'urologists',
-    'urologist': 'urologists',
-    'pulmonology': 'pulmonologists',
-    'pulmonologist': 'pulmonologists',
-    'endocrinology': 'endocrinologists',
-    'endocrinologist': 'endocrinologists',
-    'rheumatology': 'rheumatologists',
-    'rheumatologist': 'rheumatologists',
-    'oncology': 'oncologists',
-    'oncologist': 'oncologists',
+    ophthalmology: 'ophthalmologists',
+    ophthalmologist: 'ophthalmologists',
+    dentist: 'dentists',
+    dentistry: 'dentists',
+    gastroenterology: 'gastroenterologists',
+    gastroenterologist: 'gastroenterologists',
+    urology: 'urologists',
+    urologist: 'urologists',
+    pulmonology: 'pulmonologists',
+    pulmonologist: 'pulmonologists',
+    endocrinology: 'endocrinologists',
+    endocrinologist: 'endocrinologists',
+    rheumatology: 'rheumatologists',
+    rheumatologist: 'rheumatologists',
+    oncology: 'oncologists',
+    oncologist: 'oncologists',
     'allergy immunology': 'allergists-immunologists',
-    'allergist': 'allergists-immunologists',
+    allergist: 'allergists-immunologists',
     'allergy-immunology': 'allergists-immunologists',
     'pain management': 'pain-management-specialists',
     'physical therapy': 'physical-therapists',
-    'chiropractor': 'chiropractors',
-    'podiatrist': 'podiatrists',
-    'optometrist': 'optometrists',
+    chiropractor: 'chiropractors',
+    podiatrist: 'podiatrists',
+    optometrist: 'optometrists',
 };
 
 const STATE_ABBREVIATIONS = {
-    'alabama': 'al', 'alaska': 'ak', 'arizona': 'az', 'arkansas': 'ar', 'california': 'ca',
-    'colorado': 'co', 'connecticut': 'ct', 'delaware': 'de', 'florida': 'fl', 'georgia': 'ga',
-    'hawaii': 'hi', 'idaho': 'id', 'illinois': 'il', 'indiana': 'in', 'iowa': 'ia',
-    'kansas': 'ks', 'kentucky': 'ky', 'louisiana': 'la', 'maine': 'me', 'maryland': 'md',
-    'massachusetts': 'ma', 'michigan': 'mi', 'minnesota': 'mn', 'mississippi': 'ms', 'missouri': 'mo',
-    'montana': 'mt', 'nebraska': 'ne', 'nevada': 'nv', 'new hampshire': 'nh', 'new jersey': 'nj',
-    'new mexico': 'nm', 'new york': 'ny', 'north carolina': 'nc', 'north dakota': 'nd', 'ohio': 'oh',
-    'oklahoma': 'ok', 'oregon': 'or', 'pennsylvania': 'pa', 'rhode island': 'ri', 'south carolina': 'sc',
-    'south dakota': 'sd', 'tennessee': 'tn', 'texas': 'tx', 'utah': 'ut', 'vermont': 'vt',
-    'virginia': 'va', 'washington': 'wa', 'west virginia': 'wv', 'wisconsin': 'wi', 'wyoming': 'wy',
+    alabama: 'al',
+    alaska: 'ak',
+    arizona: 'az',
+    arkansas: 'ar',
+    california: 'ca',
+    colorado: 'co',
+    connecticut: 'ct',
+    delaware: 'de',
+    florida: 'fl',
+    georgia: 'ga',
+    hawaii: 'hi',
+    idaho: 'id',
+    illinois: 'il',
+    indiana: 'in',
+    iowa: 'ia',
+    kansas: 'ks',
+    kentucky: 'ky',
+    louisiana: 'la',
+    maine: 'me',
+    maryland: 'md',
+    massachusetts: 'ma',
+    michigan: 'mi',
+    minnesota: 'mn',
+    mississippi: 'ms',
+    missouri: 'mo',
+    montana: 'mt',
+    nebraska: 'ne',
+    nevada: 'nv',
+    'new hampshire': 'nh',
+    'new jersey': 'nj',
+    'new mexico': 'nm',
+    'new york': 'ny',
+    'north carolina': 'nc',
+    'north dakota': 'nd',
+    ohio: 'oh',
+    oklahoma: 'ok',
+    oregon: 'or',
+    pennsylvania: 'pa',
+    'rhode island': 'ri',
+    'south carolina': 'sc',
+    'south dakota': 'sd',
+    tennessee: 'tn',
+    texas: 'tx',
+    utah: 'ut',
+    vermont: 'vt',
+    virginia: 'va',
+    washington: 'wa',
+    'west virginia': 'wv',
+    wisconsin: 'wi',
+    wyoming: 'wy',
 };
 
-// ============================================================================
-// UTILITY FUNCTIONS
-// ============================================================================
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const randomInt = (min, max) => Math.floor(min + Math.random() * (max - min + 1));
+const pickRandom = (arr) => arr[Math.floor(Math.random() * arr.length)];
+
+const cleanText = (text) => {
+    if (!text) return null;
+    const out = String(text).replace(/\s+/g, ' ').trim();
+    return out.length ? out : null;
+};
+
+const safeJsonParse = (text) => {
+    try {
+        return JSON.parse(text);
+    } catch {
+        return null;
+    }
+};
+
+const normalizeUrl = (href) => {
+    if (!href) return null;
+    const trimmed = String(href).trim();
+    if (!trimmed) return null;
+    if (trimmed.startsWith('http://') || trimmed.startsWith('https://')) return trimmed;
+    if (trimmed.startsWith('//')) return `https:${trimmed}`;
+    if (trimmed.startsWith('/')) return `${BASE_URL}${trimmed}`;
+    return `${BASE_URL}/${trimmed.replace(/^\.?\//, '')}`;
+};
+
+const isProbablyBlocked = ({ statusCode, body }) => {
+    const s = statusCode || 0;
+    const text = (body || '').toLowerCase();
+    if ([401, 403, 429, 503].includes(s)) return true;
+    if (text.includes('attention required') && text.includes('cloudflare')) return true;
+    if (text.includes('sorry, you have been blocked')) return true;
+    if (text.includes('cf-ray') && text.includes('cloudflare')) return true;
+    return false;
+};
+
+const mergeSetCookie = (jar, setCookieHeader) => {
+    if (!setCookieHeader) return;
+    const cookies = Array.isArray(setCookieHeader) ? setCookieHeader : [setCookieHeader];
+    for (const cookieLine of cookies) {
+        if (!cookieLine) continue;
+        const firstPart = String(cookieLine).split(';')[0];
+        const idx = firstPart.indexOf('=');
+        if (idx <= 0) continue;
+        const name = firstPart.slice(0, idx).trim();
+        const value = firstPart.slice(idx + 1).trim();
+        if (!name) continue;
+        jar[name] = value;
+    }
+};
+
+const cookieHeaderFromJar = (jar) =>
+    Object.entries(jar)
+        .filter(([k, v]) => k && v != null)
+        .map(([k, v]) => `${k}=${v}`)
+        .join('; ');
 
 const getSpecialtySlug = (specialty) => {
     if (!specialty) return 'doctors';
-    const normalized = specialty.toLowerCase().trim().replace(/-/g, ' ');
-    return SPECIALTY_SLUGS[normalized] || specialty.toLowerCase().trim().replace(/\s+/g, '-').replace(/[^a-z0-9-]/g, '');
+    const normalized = String(specialty).toLowerCase().trim().replace(/-/g, ' ');
+    return (
+        SPECIALTY_SLUGS[normalized] ||
+        String(specialty)
+            .toLowerCase()
+            .trim()
+            .replace(/\s+/g, '-')
+            .replace(/[^a-z0-9-]/g, '')
+    );
 };
 
 const parseLocation = (location) => {
     if (!location) return null;
-    const normalized = location.toLowerCase().trim();
+    const normalized = String(location).toLowerCase().trim();
 
     if (normalized.includes(',')) {
-        const [cityPart, statePart] = normalized.split(',').map(s => s.trim());
+        const [cityPart, statePart] = normalized.split(',').map((s) => s.trim());
         if (cityPart && statePart) {
             const stateAbbrev = statePart.length === 2 ? statePart : STATE_ABBREVIATIONS[statePart];
             if (stateAbbrev) {
@@ -102,7 +211,10 @@ const parseLocation = (location) => {
         const lastPart = parts[parts.length - 1];
         const stateAbbrev = lastPart.length === 2 ? lastPart : STATE_ABBREVIATIONS[lastPart];
         if (stateAbbrev) {
-            const city = parts.slice(0, -1).join('-').replace(/[^a-z0-9-]/g, '');
+            const city = parts
+                .slice(0, -1)
+                .join('-')
+                .replace(/[^a-z0-9-]/g, '');
             return { state: stateAbbrev, city: city || null };
         }
     }
@@ -132,422 +244,860 @@ const buildListingUrl = ({ specialty, location, page = 1 }) => {
     return url;
 };
 
-const cleanText = (text) => {
-    if (!text) return null;
-    return text.replace(/\s+/g, ' ').trim() || null;
+const toPlaywrightProxy = (proxyUrl) => {
+    if (!proxyUrl) return undefined;
+    try {
+        const u = new URL(proxyUrl);
+        return {
+            server: `${u.protocol}//${u.hostname}:${u.port}`,
+            username: u.username ? decodeURIComponent(u.username) : undefined,
+            password: u.password ? decodeURIComponent(u.password) : undefined,
+        };
+    } catch {
+        return undefined;
+    }
 };
 
-const randomDelay = (min = 100, max = 300) =>
-    new Promise(resolve => setTimeout(resolve, min + Math.random() * (max - min)));
-
 // ============================================================================
-// DATA EXTRACTION FUNCTIONS
+// EXTRACTION (HTML + JSON-LD)
 // ============================================================================
 
-const extractDoctorsFromListing = ($) => {
-    const doctors = [];
-    const seenUrls = new Set();
+const extractJsonLd = ($) => {
+    let data = null;
+    $('script[type="application/ld+json"]').each((_, el) => {
+        const raw = $(el).text() || $(el).html();
+        const parsed = raw ? safeJsonParse(raw) : null;
+        const items = parsed ? (Array.isArray(parsed) ? parsed : [parsed]) : [];
 
-    // Find all doctor profile links
-    $('a[href*="/doctors/"]').each((_, el) => {
-        try {
-            const $el = $(el);
-            const href = $el.attr('href');
-            if (!href || !href.match(/\/doctors\/[Dd]r-/) || seenUrls.has(href)) return;
+        for (const item of items) {
+            const type = item?.['@type'];
+            if (!type) continue;
+            const types = Array.isArray(type) ? type : [type];
+            const matches = types.some((t) => ['MedicalBusiness', 'Physician', 'Person', 'LocalBusiness'].includes(t));
+            if (!matches) continue;
 
-            seenUrls.add(href);
-            const fullUrl = href.startsWith('http') ? href : `${BASE_URL}${href}`;
-
-            // Get name from link or parent
-            const $parent = $el.closest('div, article, section, li');
-            let name = $el.text().trim();
-            if (!name || name.length < 3) {
-                name = $parent.find('h2, h3, h4, [class*="name"]').first().text().trim();
-            }
-
-            // Skip non-name links
-            if (!name || name.length < 3 || name.includes('View') || name.includes('More') || name.includes('See')) return;
-
-            const specialty = $parent.find('[class*="specialty"]').text().trim();
-            const location = $parent.find('[class*="location"], [class*="address"]').text().trim();
-            const ratingText = $parent.find('[class*="rating"]').text();
-            const ratingMatch = ratingText.match(/(\d+\.?\d*)/);
-
-            doctors.push({
-                url: fullUrl,
-                name: cleanText(name),
-                specialty: cleanText(specialty) || null,
-                location: cleanText(location) || null,
-                rating: ratingMatch ? parseFloat(ratingMatch[1]) : null,
-            });
-        } catch (err) {
-            log.debug(`Error extracting doctor: ${err.message}`);
+            const address = item.address && typeof item.address === 'object' ? item.address : null;
+            data = {
+                name: item.name || null,
+                specialty: item.medicalSpecialty?.name || item.specialty || null,
+                bio: item.description || null,
+                phone: item.telephone || null,
+                email: item.email || null,
+                image: item.image?.url || item.image || null,
+                rating: item.aggregateRating?.ratingValue ?? null,
+                reviewCount: item.aggregateRating?.reviewCount ?? null,
+                address: address
+                    ? {
+                          street: address.streetAddress || null,
+                          city: address.addressLocality || null,
+                          state: address.addressRegion || null,
+                          zip: address.postalCode || null,
+                      }
+                    : null,
+            };
+            break;
         }
+    });
+    return data;
+};
+
+const extractDoctorFromHtml = ($) => {
+    const name =
+        cleanText($('h1').first().text()) ||
+        cleanText($('[data-testid*="name"], [class*="Name"]').first().text()) ||
+        null;
+
+    const phone = cleanText($('a[href^="tel:"]').first().text()) || null;
+    const email =
+        $('a[href^="mailto:"]').attr('href')?.replace(/^mailto:/i, '').trim() ||
+        cleanText($('[data-testid*="email"]').first().text()) ||
+        null;
+    const website =
+        $('a[href*="http"]')
+            .filter((_, a) => ($(a).text() || '').toLowerCase().includes('website'))
+            .attr('href') || null;
+
+    const specialty =
+        cleanText($('[class*="specialty"]').first().text()) ||
+        cleanText($('[data-testid*="specialty"]').first().text()) ||
+        null;
+
+    const ratingText = cleanText($('[class*="rating"]').first().text()) || '';
+    const ratingMatch = ratingText.match(/(\d+(\.\d+)?)/);
+    const rating = ratingMatch ? Number(ratingMatch[1]) : null;
+
+    const bio =
+        cleanText($('[class*="bio"], [class*="about"], [data-testid*="bio"]').first().text()) ||
+        cleanText($('meta[name="description"]').attr('content')) ||
+        null;
+
+    const image = $('img[class*="photo"], img[class*="profile"], img[alt*="Dr"]').attr('src') || null;
+
+    return {
+        name,
+        specialty,
+        phone,
+        email,
+        website,
+        rating,
+        bio,
+        image,
+    };
+};
+
+const extractDoctorsFromListingHtml = ($) => {
+    const doctors = [];
+    const seen = new Set();
+
+    const allowedPath = /\/(doctors|dentists|podiatrists|optometrists|chiropractors)\/[^?#]+/i;
+    const excluded = /(write-review|claim|insurance|credentials|video|office-locations|reviews)/i;
+
+    $('a[href]').each((_, a) => {
+        const href = $(a).attr('href');
+        if (!href) return;
+        if (!allowedPath.test(href) || excluded.test(href)) return;
+
+        const url = normalizeUrl(href);
+        if (!url || seen.has(url)) return;
+        seen.add(url);
+
+        const $card = $(a).closest('article, li, section, div');
+        const nameRaw =
+            cleanText($(a).attr('aria-label')) ||
+            cleanText($(a).text()) ||
+            cleanText($card.find('h2, h3, h4, [class*="name"]').first().text());
+
+        if (!nameRaw || nameRaw.length < 3) return;
+        if (/view|more|see/i.test(nameRaw)) return;
+
+        const specialty = cleanText($card.find('[class*="specialty"]').first().text());
+        const location = cleanText($card.find('[class*="location"], [class*="address"]').first().text());
+        const ratingText = cleanText($card.find('[class*="rating"]').first().text()) || '';
+        const ratingMatch = ratingText.match(/(\d+(\.\d+)?)/);
+
+        doctors.push({
+            url,
+            name: nameRaw,
+            specialty,
+            location,
+            rating: ratingMatch ? Number(ratingMatch[1]) : null,
+        });
     });
 
     return doctors;
 };
 
-const extractJsonLd = ($) => {
-    let data = null;
-    $('script[type="application/ld+json"]').each((_, el) => {
-        try {
-            const json = JSON.parse($(el).html());
-            const items = Array.isArray(json) ? json : [json];
-            for (const item of items) {
-                if (['MedicalBusiness', 'Physician', 'Person', 'LocalBusiness'].includes(item['@type'])) {
-                    data = {
-                        name: item.name || null,
-                        specialty: item.medicalSpecialty?.name || item.specialty || null,
-                        bio: item.description || null,
-                        phone: item.telephone || null,
-                        email: item.email || null,
-                        image: item.image?.url || item.image || null,
-                        rating: item.aggregateRating?.ratingValue || null,
-                        reviewCount: item.aggregateRating?.reviewCount || null,
-                        address: item.address ? {
-                            street: item.address.streetAddress || null,
-                            city: item.address.addressLocality || null,
-                            state: item.address.addressRegion || null,
-                            zip: item.address.postalCode || null,
-                        } : null,
-                    };
-                    break;
-                }
-            }
-        } catch { /* ignore */ }
-    });
-    return data;
+// ============================================================================
+// EXTRACTION (JSON - Next.js `_next/data/...`)
+// ============================================================================
+
+const extractNextDataFromHtml = (html) => {
+    if (!html) return null;
+    const match = String(html).match(/<script[^>]+id="__NEXT_DATA__"[^>]*>([\s\S]*?)<\/script>/i);
+    if (!match?.[1]) return null;
+    return safeJsonParse(match[1].trim());
 };
 
-const extractFromHtml = ($) => ({
-    name: cleanText($('h1').first().text()) || null,
-    specialty: cleanText($('[class*="specialty"]').first().text()) || null,
-    bio: cleanText($('[class*="bio"], [class*="about"]').first().text()) || null,
-    phone: $('a[href^="tel:"]').first().text().trim() || null,
-    email: $('a[href^="mailto:"]').attr('href')?.replace('mailto:', '').trim() || null,
-    image: $('img[class*="photo"], img[class*="profile"]').attr('src') || null,
-    education: cleanText($('[class*="education"]').text()) || null,
-    insurance: cleanText($('[class*="insurance"]').text()) || null,
-});
+const buildNextDataUrl = ({ buildId, pageUrl }) => {
+    if (!buildId || !pageUrl) return null;
+    const u = new URL(pageUrl);
+    let pathname = u.pathname;
+    if (pathname.endsWith('/')) pathname = pathname.slice(0, -1);
+    if (!pathname) pathname = '/';
+    if (pathname === '/') pathname = '/index';
+    const url = new URL(`${u.origin}/_next/data/${buildId}${pathname}.json`);
+    url.search = u.search;
+    return url.toString();
+};
+
+const walkJson = (root, onObject) => {
+    const seen = new Set();
+    const stack = [root];
+    while (stack.length) {
+        const cur = stack.pop();
+        if (!cur || typeof cur !== 'object') continue;
+        if (seen.has(cur)) continue;
+        seen.add(cur);
+        if (Array.isArray(cur)) {
+            for (const item of cur) stack.push(item);
+            continue;
+        }
+        onObject(cur);
+        for (const v of Object.values(cur)) stack.push(v);
+    }
+};
+
+const normalizeDoctorFromJson = (item) => {
+    if (!item || typeof item !== 'object') return null;
+    const rawUrl =
+        item.profileUrl ||
+        item.profile_url ||
+        item.url ||
+        item.seoUrl ||
+        item.seo_url ||
+        item.canonicalUrl ||
+        item.canonical_url ||
+        null;
+    const url = normalizeUrl(rawUrl);
+    if (!url) return null;
+
+    const name = cleanText(item.name || item.fullName || item.displayName || item.providerName || item.title);
+    const specialty =
+        cleanText(item.specialty) ||
+        cleanText(item.primarySpecialty) ||
+        cleanText(Array.isArray(item.specialties) ? item.specialties?.[0] : null) ||
+        cleanText(item.medicalSpecialty?.name) ||
+        null;
+
+    const city = cleanText(item.city || item.address?.city || item.addressLocality);
+    const state = cleanText(item.state || item.address?.state || item.addressRegion);
+    const location = city && state ? `${city}, ${state}` : cleanText(item.location || item.practiceLocation || null);
+
+    const rating =
+        typeof item.rating === 'number'
+            ? item.rating
+            : typeof item.averageRating === 'number'
+              ? item.averageRating
+              : item.aggregateRating?.ratingValue != null
+                ? Number(item.aggregateRating.ratingValue)
+                : null;
+
+    const reviewCount =
+        item.reviewCount != null
+            ? Number(item.reviewCount)
+            : item.reviews != null
+              ? Number(item.reviews)
+              : item.aggregateRating?.reviewCount != null
+                ? Number(item.aggregateRating.reviewCount)
+                : null;
+
+    const doctorId = cleanText(item.id || item.providerId || item.provider_id || item.doctorId || item.doctor_id || null);
+
+    return {
+        url,
+        doctorId,
+        name,
+        specialty,
+        location,
+        rating: Number.isFinite(rating) ? rating : null,
+        reviewCount: Number.isFinite(reviewCount) ? reviewCount : null,
+    };
+};
+
+const extractDoctorsFromNextData = (nextDataJson) => {
+    const out = [];
+    const seen = new Set();
+    const likelyListKeys = ['providers', 'results', 'items', 'profiles', 'doctors', 'physicians'];
+
+    const considerArray = (arr) => {
+        if (!Array.isArray(arr) || !arr.length) return;
+        for (const item of arr.slice(0, 30)) {
+            const normalized = normalizeDoctorFromJson(item);
+            if (!normalized?.url) continue;
+            if (seen.has(normalized.url)) continue;
+            seen.add(normalized.url);
+            out.push(normalized);
+        }
+    };
+
+    walkJson(nextDataJson, (obj) => {
+        for (const [k, v] of Object.entries(obj)) {
+            const key = k.toLowerCase();
+            if (!likelyListKeys.some((x) => key.includes(x))) continue;
+            considerArray(v);
+        }
+    });
+
+    return out;
+};
+
+const extractBestProfileObjectFromJson = (root) => {
+    let best = null;
+    let bestScore = 0;
+
+    const scoreObject = (obj) => {
+        const name = obj?.name || obj?.fullName || obj?.displayName;
+        if (typeof name !== 'string' || name.trim().length < 3) return 0;
+        let score = 1;
+        if (obj.telephone || obj.phone || obj.phoneNumber) score += 2;
+        if (obj.address || obj.locations || obj.location) score += 1;
+        if (obj.bio || obj.description || obj.about) score += 1;
+        if (obj.aggregateRating || obj.rating || obj.averageRating) score += 1;
+        if (obj.specialty || obj.specialties || obj.medicalSpecialty) score += 1;
+        return score;
+    };
+
+    walkJson(root, (obj) => {
+        const score = scoreObject(obj);
+        if (score > bestScore) {
+            bestScore = score;
+            best = obj;
+        }
+    });
+
+    return best;
+};
+
+const normalizeDoctorDetailsFromJson = (obj) => {
+    if (!obj || typeof obj !== 'object') return null;
+    const addressObj = obj.address && typeof obj.address === 'object' ? obj.address : null;
+    const city = cleanText(addressObj?.city || addressObj?.addressLocality || obj.city);
+    const state = cleanText(addressObj?.state || addressObj?.addressRegion || obj.state);
+
+    const specialties = Array.isArray(obj.specialties) ? obj.specialties.map(cleanText).filter(Boolean) : [];
+    const specialty =
+        cleanText(obj.specialty) ||
+        cleanText(obj.primarySpecialty) ||
+        cleanText(obj.medicalSpecialty?.name) ||
+        specialties[0] ||
+        null;
+
+    const rating =
+        typeof obj.rating === 'number'
+            ? obj.rating
+            : typeof obj.averageRating === 'number'
+              ? obj.averageRating
+              : obj.aggregateRating?.ratingValue != null
+                ? Number(obj.aggregateRating.ratingValue)
+                : null;
+
+    const reviewCount =
+        obj.reviewCount != null
+            ? Number(obj.reviewCount)
+            : obj.reviews != null
+              ? Number(obj.reviews)
+              : obj.aggregateRating?.reviewCount != null
+                ? Number(obj.aggregateRating.reviewCount)
+                : null;
+
+    return {
+        name: cleanText(obj.name || obj.fullName || obj.displayName) || null,
+        doctorId: cleanText(obj.id || obj.providerId || obj.doctorId || null) || null,
+        specialty,
+        specialties: specialties.length ? specialties : null,
+        bio: cleanText(obj.bio || obj.description || obj.about || null),
+        phone: cleanText(obj.telephone || obj.phone || obj.phoneNumber || null),
+        email: cleanText(obj.email || null),
+        website: cleanText(obj.website || obj.url || null),
+        rating: Number.isFinite(rating) ? rating : null,
+        reviewCount: Number.isFinite(reviewCount) ? reviewCount : null,
+        address:
+            city || state
+                ? {
+                      street: cleanText(addressObj?.street || addressObj?.streetAddress || null),
+                      city,
+                      state,
+                      zip: cleanText(addressObj?.zip || addressObj?.postalCode || null),
+                  }
+                : null,
+        location: city && state ? `${city}, ${state}` : null,
+        image: cleanText(obj.image?.url || obj.image || null),
+        education: cleanText(obj.education || null),
+        certifications: Array.isArray(obj.certifications) ? obj.certifications.map(cleanText).filter(Boolean) : null,
+        accepted_insurance: Array.isArray(obj.acceptedInsurance)
+            ? obj.acceptedInsurance.map(cleanText).filter(Boolean)
+            : null,
+    };
+};
 
 // ============================================================================
-// MAIN ACTOR
+// HTTP CLIENT (got-scraping) + Playwright bootstrap (only if blocked)
 // ============================================================================
+
+const createHttpContext = ({ proxyConfiguration, persistState }) => {
+    const state = persistState || { buildId: null, cookieJar: {}, userAgent: pickRandom(USER_AGENTS) };
+    if (!state.cookieJar || typeof state.cookieJar !== 'object') state.cookieJar = {};
+    if (!state.userAgent) state.userAgent = pickRandom(USER_AGENTS);
+    if (!state.sessionId) state.sessionId = `vitals_${Date.now()}_${randomInt(1000, 9999)}`;
+
+    const rotateSession = () => {
+        state.sessionId = `vitals_${Date.now()}_${randomInt(1000, 9999)}`;
+        state.cookieJar = {};
+        state.userAgent = pickRandom(USER_AGENTS);
+    };
+
+    const getProxyUrl = () => {
+        if (!proxyConfiguration?.newUrl) return undefined;
+        try {
+            return proxyConfiguration.newUrl(state.sessionId);
+        } catch {
+            return proxyConfiguration.newUrl();
+        }
+    };
+
+    const fetch = async ({ url, responseType = 'text', headers = {}, maxRetries = 3 }) => {
+        let lastErr = null;
+        for (let attempt = 1; attempt <= maxRetries; attempt++) {
+            const proxyUrl = getProxyUrl();
+            const cookieHeader = cookieHeaderFromJar(state.cookieJar);
+            const ua = state.userAgent || pickRandom(USER_AGENTS);
+            const mergedHeaders = {
+                accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                'accept-language': 'en-US,en;q=0.9',
+                'cache-control': 'no-cache',
+                pragma: 'no-cache',
+                'user-agent': ua,
+                ...(cookieHeader ? { cookie: cookieHeader } : {}),
+                ...headers,
+            };
+
+            try {
+                const res = await gotScraping({
+                    url,
+                    method: 'GET',
+                    responseType,
+                    proxyUrl,
+                    headers: mergedHeaders,
+                    timeout: { request: 45000 },
+                    http2: true,
+                    throwHttpErrors: false,
+                    followRedirect: true,
+                });
+
+                mergeSetCookie(state.cookieJar, res.headers?.['set-cookie']);
+                const body = res.body;
+                if (isProbablyBlocked({ statusCode: res.statusCode, body })) {
+                    lastErr = new Error(`Blocked (${res.statusCode})`);
+                    if (attempt === Math.ceil(maxRetries / 2)) rotateSession();
+                    await sleep(randomInt(800, 1600));
+                    continue;
+                }
+
+                return { statusCode: res.statusCode, headers: res.headers, body, proxyUrlUsed: proxyUrl };
+            } catch (err) {
+                lastErr = err;
+                if (attempt === Math.ceil(maxRetries / 2)) rotateSession();
+                await sleep(randomInt(800, 1600));
+            }
+        }
+        throw lastErr || new Error('Request failed');
+    };
+
+    return { state, fetch, getProxyUrl };
+};
+
+const bootstrapWithPlaywright = async ({ url, httpContext, proxyUrl, hardTimeoutMs = 90000 }) => {
+    const ua = pickRandom(USER_AGENTS);
+    const proxy = toPlaywrightProxy(proxyUrl);
+    const start = Date.now();
+
+    const browser = await firefox.launch({
+        headless: true,
+        proxy,
+        args: ['--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu', '--disable-extensions'],
+    });
+
+    try {
+        const context = await browser.newContext({
+            userAgent: ua,
+            viewport: { width: 1920 + randomInt(-40, 40), height: 1080 + randomInt(-30, 30) },
+            locale: 'en-US',
+        });
+
+        await context.addInitScript(() => {
+            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+        });
+
+        const page = await context.newPage();
+        await page.route('**/*', (route) => {
+            const type = route.request().resourceType();
+            const rUrl = route.request().url();
+            if (['image', 'font', 'media'].includes(type)) return route.abort();
+            if (rUrl.includes('googletagmanager') || rUrl.includes('google-analytics') || rUrl.includes('doubleclick')) return route.abort();
+            return route.continue();
+        });
+
+        await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
+        await page.waitForTimeout(2000);
+
+        while (Date.now() - start < hardTimeoutMs) {
+            const content = await page.content();
+            if (!isProbablyBlocked({ statusCode: 200, body: content })) break;
+            await page.waitForTimeout(1500);
+        }
+
+        const cookies = await context.cookies();
+        for (const c of cookies) httpContext.state.cookieJar[c.name] = c.value;
+        httpContext.state.userAgent = await page.evaluate(() => navigator.userAgent);
+
+        const html = await page.content();
+        const nextData = extractNextDataFromHtml(html);
+        if (nextData?.buildId) httpContext.state.buildId = nextData.buildId;
+        return { html, buildId: httpContext.state.buildId, cookiesCount: cookies.length };
+    } finally {
+        await browser.close();
+    }
+};
 
 await Actor.init();
-
 try {
     const input = (await Actor.getInput()) || {};
     const {
         specialty = 'Cardiovascular Disease',
         location = 'New York, NY',
+        startUrl,
         collectDetails = true,
         results_wanted: resultsWantedRaw = 50,
         max_pages: maxPagesRaw = 5,
-        maxConcurrency = 2,
+        maxConcurrency: maxConcurrencyRaw = 5,
         proxyConfiguration: proxyConfig,
     } = input;
 
     const resultsWanted = Number.isFinite(+resultsWantedRaw) ? Math.max(1, +resultsWantedRaw) : 50;
     const maxPages = Number.isFinite(+maxPagesRaw) ? Math.max(1, +maxPagesRaw) : 5;
+    const maxConcurrency = Number.isFinite(+maxConcurrencyRaw) ? Math.min(10, Math.max(1, +maxConcurrencyRaw)) : 5;
 
     const proxyConfiguration = proxyConfig
         ? await Actor.createProxyConfiguration(proxyConfig)
         : await Actor.createProxyConfiguration({ useApifyProxy: true });
 
     const kvStore = await KeyValueStore.open();
+    const persisted = (await kvStore.getValue(KV_KEY)) || {};
+    const httpContext = createHttpContext({ proxyConfiguration, persistState: persisted });
+
     const startTime = Date.now();
     const MAX_RUNTIME_MS = 4.5 * 60 * 1000;
+    const stats = {
+        listingPages: 0,
+        listingDoctors: 0,
+        detailPages: 0,
+        jsonPages: 0,
+        htmlPages: 0,
+        playwrightBootstraps: 0,
+        blocked: 0,
+        errors: 0,
+        saved: 0,
+    };
+    const isTimedOut = () => Date.now() - startTime > MAX_RUNTIME_MS;
 
-    // Stats
-    const stats = { pagesProcessed: 0, doctorsFound: 0, detailsFetched: 0, errors: 0, httpSuccess: 0, playwrightFallback: 0 };
-    const seenUrls = new Set();
-    let savedCount = 0;
+    log.info('Vitals.com Physician Scraper');
+    log.info(`Search: specialty="${specialty}" slug="${getSpecialtySlug(specialty)}" location="${location}"`);
+    log.info(
+        `Target: ${resultsWanted} results, maxPages=${maxPages}, collectDetails=${collectDetails}, concurrency=${maxConcurrency}`,
+    );
 
-    // Session data for HTTP requests
-    let sessionData = { cookies: [], userAgent: '' };
-
-    log.info('='.repeat(65));
-    log.info('🏥 VITALS.COM PHYSICIAN SCRAPER - HYBRID MODE');
-    log.info('='.repeat(65));
-    log.info(`🎯 Specialty: ${specialty} → ${getSpecialtySlug(specialty)}`);
-    log.info(`📍 Location: ${location}`);
-    log.info(`📊 Target: ${resultsWanted} physicians, max ${maxPages} pages`);
-    log.info('='.repeat(65));
-
-    // Build listing URLs
-    const listingRequests = [];
-    for (let page = 1; page <= maxPages; page++) {
-        listingRequests.push({
-            url: buildListingUrl({ specialty, location, page }),
-            label: 'LISTING',
-            userData: { page },
-        });
+    const listingUrls = [];
+    if (startUrl) {
+        listingUrls.push(String(startUrl));
+    } else {
+        for (let page = 1; page <= maxPages; page++) listingUrls.push(buildListingUrl({ specialty, location, page }));
     }
 
-    // Detail URLs queue - populated from listings
-    const detailRequests = [];
+    const listingDoctors = [];
+    const seenProfileUrls = new Set();
 
-    log.info(`📄 Queued ${listingRequests.length} listing pages`);
-    log.info(`   First URL: ${listingRequests[0]?.url}`);
+    const ensureBuildId = async (seedUrl) => {
+        if (httpContext.state.buildId) return httpContext.state.buildId;
 
-    // ========================================================================
-    // PLAYWRIGHT CRAWLER - LISTINGS + DETAILS
-    // ========================================================================
+        let html = null;
+        try {
+            const res = await httpContext.fetch({ url: seedUrl, responseType: 'text', maxRetries: 2 });
+            html = res.body;
+        } catch (err) {
+            stats.blocked++;
+            log.warning(`Seed HTML fetch blocked/failed, bootstrapping with browser: ${err.message}`);
+        }
 
-    const crawler = new PlaywrightCrawler({
-        proxyConfiguration,
-        maxConcurrency: Math.min(maxConcurrency, 2),
-        maxRequestRetries: 2,
-        requestHandlerTimeoutSecs: 60,
-        navigationTimeoutSecs: 45,
-
-        launchContext: {
-            launcher: firefox,
-            launchOptions: {
-                headless: true,
-                args: [
-                    '--no-sandbox',
-                    '--disable-dev-shm-usage',
-                    '--disable-gpu',
-                    '--disable-extensions',
-                ],
-            },
-        },
-
-        browserPoolOptions: {
-            maxOpenPagesPerBrowser: 1,
-            useFingerprints: true,
-            fingerprintOptions: {
-                fingerprintGeneratorOptions: {
-                    browsers: ['firefox'],
-                    operatingSystems: ['windows', 'macos'],
-                    locales: ['en-US'],
-                },
-            },
-        },
-
-        preNavigationHooks: [
-            async ({ page }) => {
-                await page.setViewportSize({
-                    width: 1920 + Math.floor(Math.random() * 80) - 40,
-                    height: 1080 + Math.floor(Math.random() * 60) - 30,
-                });
-
-                await page.addInitScript(() => {
-                    Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-                });
-
-                // Block heavy resources
-                await page.route('**/*', (route) => {
-                    const type = route.request().resourceType();
-                    const url = route.request().url();
-                    if (['image', 'font', 'media'].includes(type)) return route.abort();
-                    if (url.includes('google-analytics') || url.includes('googletagmanager') ||
-                        url.includes('facebook') || url.includes('doubleclick')) return route.abort();
-                    return route.continue();
-                });
-            },
-        ],
-
-        async requestHandler({ request, page, log: crawlerLog }) {
-            const { url, label, userData } = request;
-
-            // Timeout check
-            if (Date.now() - startTime > MAX_RUNTIME_MS) {
-                crawlerLog.info('⏱️ Timeout approaching, stopping...');
-                return;
+        if (html) {
+            const nextData = extractNextDataFromHtml(html);
+            if (nextData?.buildId) {
+                httpContext.state.buildId = nextData.buildId;
+                return httpContext.state.buildId;
             }
+        }
 
-            // Skip if we already have enough results
-            if (savedCount >= resultsWanted) {
-                crawlerLog.info(`✅ Target reached (${savedCount}/${resultsWanted}), skipping...`);
-                return;
-            }
+        stats.playwrightBootstraps++;
+        const proxyUrl = httpContext.getProxyUrl();
+        const boot = await bootstrapWithPlaywright({ url: seedUrl, httpContext, proxyUrl });
+        log.info(`Bootstrap: cookies=${boot.cookiesCount} buildId=${boot.buildId || 'n/a'}`);
+        return httpContext.state.buildId;
+    };
 
-            // Skip listing pages if we already have enough URLs queued
-            if (label === 'LISTING' && detailRequests.length >= resultsWanted) {
-                crawlerLog.info(`⏭️ Already have ${detailRequests.length} URLs queued, skipping listing page`);
-                return;
-            }
+    const fetchListingDoctors = async (url) => {
+        if (isTimedOut()) return [];
 
+        const buildId = await ensureBuildId(url);
+        const nextUrl = buildId ? buildNextDataUrl({ buildId, pageUrl: url }) : null;
+
+        if (nextUrl) {
             try {
-                await page.waitForLoadState('domcontentloaded', { timeout: 30000 });
-                await page.waitForTimeout(1000 + Math.random() * 500);
+                const res = await httpContext.fetch({
+                    url: nextUrl,
+                    responseType: 'text',
+                    headers: { accept: 'application/json,*/*;q=0.8' },
+                    maxRetries: 3,
+                });
+                const json = typeof res.body === 'string' ? safeJsonParse(res.body) : res.body;
+                const docs = json ? extractDoctorsFromNextData(json) : [];
+                if (docs.length) {
+                    stats.jsonPages++;
+                    return docs;
+                }
             } catch (err) {
-                crawlerLog.warning(`Load timeout: ${err.message}`);
+                stats.blocked++;
+                log.debug(`Listing JSON failed: ${err.message}`);
             }
+        }
 
-            const html = await page.content();
-            const $ = cheerioLoad(html);
+        try {
+            const res = await httpContext.fetch({ url, responseType: 'text', maxRetries: 3 });
+            const nextData = extractNextDataFromHtml(res.body);
+            if (nextData?.buildId) httpContext.state.buildId = nextData.buildId;
+            const $ = cheerioLoad(res.body);
+            const docs = extractDoctorsFromListingHtml($);
+            if (docs.length) {
+                stats.htmlPages++;
+                return docs;
+            }
+        } catch (err) {
+            stats.blocked++;
+            log.warning(`Listing HTML failed: ${url} (${err.message})`);
+        }
 
-            if (label === 'LISTING') {
-                crawlerLog.info(`🔄 Listing page ${userData.page}: ${url}`);
-                stats.pagesProcessed++;
+        // 3) Browser fallback (only if JSON+HTML failed) - ensures we can handle client-rendered listings.
+        try {
+            stats.playwrightBootstraps++;
+            const proxyUrl = httpContext.getProxyUrl();
+            const boot = await bootstrapWithPlaywright({ url, httpContext, proxyUrl, hardTimeoutMs: 60000 });
+            const $ = cheerioLoad(boot.html);
+            const docs = extractDoctorsFromListingHtml($);
+            if (docs.length) {
+                stats.htmlPages++;
+                return docs;
+            }
+        } catch (err) {
+            stats.errors++;
+            log.warning(`Listing Playwright fallback failed: ${url} (${err.message})`);
+        }
 
-                // Scroll to load lazy content
-                try {
-                    await page.evaluate(async () => {
-                        for (let i = 0; i < 3; i++) {
-                            window.scrollTo(0, document.body.scrollHeight * (i + 1) / 3);
-                            await new Promise(r => setTimeout(r, 300));
-                        }
-                    });
-                    await page.waitForTimeout(500);
-                } catch { /* ignore */ }
+        return [];
+    };
 
-                // Re-get HTML after scroll
-                const scrolledHtml = await page.content();
-                const $scrolled = cheerioLoad(scrolledHtml);
-                const doctors = extractDoctorsFromListing($scrolled);
+    for (const url of listingUrls) {
+        if (isTimedOut() || listingDoctors.length >= resultsWanted) break;
 
-                crawlerLog.info(`✅ Found ${doctors.length} doctors on page ${userData.page}`);
-                stats.doctorsFound += doctors.length;
+        stats.listingPages++;
+        log.info(`Listing: ${url}`);
+        const docs = await fetchListingDoctors(url);
+        stats.listingDoctors += docs.length;
 
-                // Save session cookies for HTTP layer
-                if (sessionData.cookies.length === 0) {
-                    try {
-                        const context = page.context();
-                        sessionData.cookies = await context.cookies();
-                        sessionData.userAgent = await page.evaluate(() => navigator.userAgent);
-                        await kvStore.setValue(SESSION_KEY, sessionData);
-                        crawlerLog.info(`💾 Session saved: ${sessionData.cookies.length} cookies`);
-                    } catch (err) {
-                        crawlerLog.warning(`Session save failed: ${err.message}`);
-                    }
-                }
+        for (const d of docs) {
+            if (!d?.url) continue;
+            if (seenProfileUrls.has(d.url)) continue;
+            seenProfileUrls.add(d.url);
+            listingDoctors.push(d);
+            if (listingDoctors.length >= resultsWanted) break;
+        }
 
-                // Queue detail pages (only up to resultsWanted)
-                for (const doc of doctors) {
-                    if (detailRequests.length >= resultsWanted) {
-                        crawlerLog.info(`📊 Reached ${resultsWanted} URLs, stopping extraction`);
-                        break;
-                    }
-                    if (seenUrls.has(doc.url)) continue;
-                    seenUrls.add(doc.url);
+        await sleep(randomInt(200, 600));
+    }
 
-                    if (collectDetails) {
-                        detailRequests.push({
-                            url: doc.url,
-                            label: 'DETAIL',
-                            userData: { doc },
-                        });
-                    } else {
-                        // Save directly without details
-                        await Dataset.pushData({
-                            ...doc,
-                            id: doc.url,
-                            source: 'listing',
+    if (!listingDoctors.length) {
+        await kvStore.setValue(KV_KEY, httpContext.state);
+        await Actor.fail(
+            'No profiles found. Likely blocked by Cloudflare; try Apify Proxy with residential IPs and lower concurrency.',
+        );
+    }
+
+    const processOneDetail = async (seed) => {
+        if (isTimedOut()) return;
+        if (stats.saved >= resultsWanted) return;
+        stats.detailPages++;
+
+        const url = seed.url;
+        const buildId = httpContext.state.buildId;
+        const nextUrl = buildId ? buildNextDataUrl({ buildId, pageUrl: url }) : null;
+
+        if (nextUrl) {
+            try {
+                const res = await httpContext.fetch({
+                    url: nextUrl,
+                    responseType: 'text',
+                    headers: { accept: 'application/json,*/*;q=0.8' },
+                    maxRetries: 3,
+                });
+                const json = typeof res.body === 'string' ? safeJsonParse(res.body) : res.body;
+                if (json) {
+                    const bestObj = extractBestProfileObjectFromJson(json);
+                    const details = normalizeDoctorDetailsFromJson(bestObj);
+                    if (details?.name || details?.phone || details?.address) {
+                        stats.jsonPages++;
+                        const record = {
+                            id: url,
+                            doctorId: details.doctorId || seed.doctorId || null,
+                            name: details.name || seed.name || null,
+                            specialty: details.specialty || seed.specialty || getSpecialtySlug(specialty),
+                            specialties: details.specialties || null,
+                            location: details.location || seed.location || location || null,
+                            phone: details.phone || null,
+                            email: details.email || null,
+                            website: details.website || null,
+                            rating: details.rating ?? seed.rating ?? null,
+                            reviews: details.reviewCount ?? seed.reviewCount ?? null,
+                            education: details.education || null,
+                            certifications: details.certifications || null,
+                            accepted_insurance: details.accepted_insurance || null,
+                            bio: details.bio || null,
+                            image: details.image || null,
+                            address: details.address || null,
+                            url,
+                            source: 'json',
                             fetched_at: new Date().toISOString(),
-                        });
-                        savedCount++;
-                        if (savedCount >= resultsWanted) break;
+                        };
+                        await Dataset.pushData(record);
+                        stats.saved++;
+                        return;
                     }
                 }
+            } catch (err) {
+                stats.blocked++;
+                log.debug(`Detail JSON failed: ${err.message}`);
+            }
+        }
 
-                crawlerLog.info(`📊 Queued ${detailRequests.length}/${resultsWanted} details`);
+        try {
+            const res = await httpContext.fetch({ url, responseType: 'text', maxRetries: 3 });
+            const nextData = extractNextDataFromHtml(res.body);
+            if (nextData?.buildId) httpContext.state.buildId = nextData.buildId;
+            const $ = cheerioLoad(res.body);
+            const jsonLd = extractJsonLd($);
+            const html = extractDoctorFromHtml($);
+            stats.htmlPages++;
 
-            } else if (label === 'DETAIL') {
-                stats.detailsFetched++;
-                const doc = userData.doc;
+            const record = {
+                id: url,
+                doctorId: seed.doctorId || null,
+                name: jsonLd?.name || html.name || seed.name || null,
+                specialty: jsonLd?.specialty || html.specialty || seed.specialty || getSpecialtySlug(specialty),
+                location:
+                    (jsonLd?.address?.city && jsonLd?.address?.state ? `${jsonLd.address.city}, ${jsonLd.address.state}` : null) ||
+                    seed.location ||
+                    location ||
+                    null,
+                phone: jsonLd?.phone || html.phone || null,
+                email: jsonLd?.email || html.email || null,
+                website: html.website || null,
+                rating: jsonLd?.rating != null ? Number(jsonLd.rating) : html.rating ?? seed.rating ?? null,
+                reviews: jsonLd?.reviewCount != null ? Number(jsonLd.reviewCount) : seed.reviewCount ?? null,
+                bio: jsonLd?.bio || html.bio || null,
+                image: jsonLd?.image || html.image || null,
+                address: jsonLd?.address || null,
+                url,
+                source: jsonLd ? 'json-ld' : 'html',
+                fetched_at: new Date().toISOString(),
+            };
 
-                // Try JSON-LD first
-                let details = extractJsonLd($);
-                if (details) {
-                    stats.httpSuccess++; // Count as structured data success
-                } else {
-                    details = extractFromHtml($);
-                    stats.playwrightFallback++;
-                }
+            await Dataset.pushData(record);
+            stats.saved++;
+        } catch (err) {
+            stats.errors++;
+            log.warning(`Detail HTML failed: ${url} (${err.message})`);
+
+            // 3) Browser fallback only if HTTP is blocked/failed.
+            try {
+                stats.playwrightBootstraps++;
+                const proxyUrl = httpContext.getProxyUrl();
+                const boot = await bootstrapWithPlaywright({ url, httpContext, proxyUrl, hardTimeoutMs: 60000 });
+                const nextData = extractNextDataFromHtml(boot.html);
+                if (nextData?.buildId) httpContext.state.buildId = nextData.buildId;
+                const $ = cheerioLoad(boot.html);
+                const jsonLd = extractJsonLd($);
+                const html = extractDoctorFromHtml($);
 
                 const record = {
-                    id: doc.url,
-                    name: details.name || doc.name,
-                    specialty: details.specialty || doc.specialty || getSpecialtySlug(specialty),
-                    location: details.address?.city
-                        ? `${details.address.city}, ${details.address.state}`
-                        : doc.location || location,
-                    phone: details.phone || null,
-                    email: details.email || null,
-                    rating: details.rating || doc.rating || null,
-                    reviewCount: details.reviewCount || null,
-                    bio: details.bio || null,
-                    education: details.education || null,
-                    insurance: details.insurance || null,
-                    image: details.image || null,
-                    address: details.address || null,
-                    url: doc.url,
-                    source: details.name ? 'json-ld' : 'html',
+                    id: url,
+                    doctorId: seed.doctorId || null,
+                    name: jsonLd?.name || html.name || seed.name || null,
+                    specialty: jsonLd?.specialty || html.specialty || seed.specialty || getSpecialtySlug(specialty),
+                    location:
+                        (jsonLd?.address?.city && jsonLd?.address?.state
+                            ? `${jsonLd.address.city}, ${jsonLd.address.state}`
+                            : null) ||
+                        seed.location ||
+                        location ||
+                        null,
+                    phone: jsonLd?.phone || html.phone || null,
+                    email: jsonLd?.email || html.email || null,
+                    website: html.website || null,
+                    rating: jsonLd?.rating != null ? Number(jsonLd.rating) : html.rating ?? seed.rating ?? null,
+                    reviews: jsonLd?.reviewCount != null ? Number(jsonLd.reviewCount) : seed.reviewCount ?? null,
+                    bio: jsonLd?.bio || html.bio || null,
+                    image: jsonLd?.image || html.image || null,
+                    address: jsonLd?.address || null,
+                    url,
+                    source: jsonLd ? 'json-ld+playwright' : 'html+playwright',
                     fetched_at: new Date().toISOString(),
                 };
 
                 await Dataset.pushData(record);
-                savedCount++;
-
-                if (savedCount % 5 === 0 || savedCount === resultsWanted) {
-                    crawlerLog.info(`📊 Progress: ${savedCount}/${resultsWanted} saved`);
-                }
+                stats.saved++;
+            } catch (pwErr) {
+                stats.errors++;
+                log.warning(`Detail Playwright fallback failed: ${url} (${pwErr.message})`);
             }
-        },
+        }
+    };
 
-        async failedRequestHandler({ request, error, log: crawlerLog }) {
-            stats.errors++;
-            crawlerLog.error(`❌ Failed: ${request.url} - ${error.message}`);
-        },
-    });
+    if (!collectDetails) {
+        for (const d of listingDoctors.slice(0, resultsWanted)) {
+            await Dataset.pushData({ ...d, id: d.url, source: 'listing', fetched_at: new Date().toISOString() });
+            stats.saved++;
+            if (stats.saved >= resultsWanted) break;
+        }
+    } else {
+        const pending = listingDoctors.slice(0, resultsWanted);
+        const inFlight = new Set();
 
-    // Run on listing pages first
-    log.info('🦊 Phase 1: Scraping listing pages...');
-    await crawler.run(listingRequests);
+        while (pending.length && stats.saved < resultsWanted && !isTimedOut()) {
+            while (inFlight.size < maxConcurrency && pending.length && stats.saved < resultsWanted && !isTimedOut()) {
+                const item = pending.shift();
+                let p;
+                p = (async () => processOneDetail(item))().finally(() => inFlight.delete(p));
+                inFlight.add(p);
+                await sleep(randomInt(80, 200));
+            }
+            if (!inFlight.size) break;
+            await Promise.race(inFlight);
+        }
 
-    log.info(`🦊 Phase 1 Complete: Found ${detailRequests.length} doctor URLs`);
-
-    // Run on detail pages if needed
-    if (collectDetails && detailRequests.length > 0 && savedCount < resultsWanted) {
-        const toProcess = detailRequests.slice(0, resultsWanted - savedCount);
-        log.info(`⚡ Phase 2: Fetching ${toProcess.length} detail pages...`);
-        await crawler.run(toProcess);
+        await Promise.allSettled([...inFlight]);
     }
 
-    // ========================================================================
-    // FINAL REPORT
-    // ========================================================================
+    await kvStore.setValue(KV_KEY, httpContext.state);
 
-    const totalTime = (Date.now() - startTime) / 1000;
-    const rate = savedCount > 0 ? (savedCount / totalTime).toFixed(2) : '0';
+    const totalTimeSec = (Date.now() - startTime) / 1000;
+    const rate = stats.saved > 0 ? (stats.saved / totalTimeSec).toFixed(2) : '0';
 
-    log.info('='.repeat(65));
-    log.info('📊 EXECUTION REPORT');
-    log.info('='.repeat(65));
-    log.info(`📄 Listing pages: ${stats.pagesProcessed}`);
-    log.info(`👨‍⚕️ Doctors found: ${stats.doctorsFound}`);
-    log.info(`🔍 Details fetched: ${stats.detailsFetched}`);
-    log.info(`✅ JSON-LD extractions: ${stats.httpSuccess}`);
-    log.info(`🔧 HTML fallbacks: ${stats.playwrightFallback}`);
-    log.info(`⚠️ Errors: ${stats.errors}`);
-    log.info('='.repeat(65));
-    log.info(`✅ Total saved: ${savedCount}/${resultsWanted}`);
-    log.info(`⏱️ Runtime: ${totalTime.toFixed(2)}s`);
-    log.info(`⚡ Rate: ${rate} physicians/sec`);
-    log.info('='.repeat(65));
+    log.info('='.repeat(60));
+    log.info('Execution summary');
+    log.info(`Listing pages: ${stats.listingPages}`);
+    log.info(`Listing doctors found: ${stats.listingDoctors}`);
+    log.info(`Detail pages attempted: ${stats.detailPages}`);
+    log.info(`Saved: ${stats.saved}/${resultsWanted}`);
+    log.info(`JSON pages parsed: ${stats.jsonPages}`);
+    log.info(`HTML pages parsed: ${stats.htmlPages}`);
+    log.info(`Playwright bootstraps: ${stats.playwrightBootstraps}`);
+    log.info(`Errors: ${stats.errors}`);
+    log.info(`Runtime: ${totalTimeSec.toFixed(2)}s (${rate} rec/s)`);
+    log.info('='.repeat(60));
 
-    if (savedCount === 0) {
-        await Actor.fail('No results scraped. Check selectors or anti-bot detection.');
+    if (stats.saved === 0) {
+        await Actor.fail(
+            'No results scraped. Likely blocked by Cloudflare; try Apify Proxy with residential IPs and reduce concurrency.',
+        );
     } else {
         await Actor.setValue('OUTPUT_SUMMARY', {
-            pagesProcessed: stats.pagesProcessed,
-            doctorsFound: stats.doctorsFound,
-            detailsFetched: stats.detailsFetched,
-            totalSaved: savedCount,
-            errors: stats.errors,
-            runtimeSeconds: totalTime,
+            search: { specialty, location, startUrl: startUrl || null },
+            resultsWanted,
+            maxPages,
+            collectDetails,
+            stats,
+            runtimeSeconds: totalTimeSec,
             success: true,
         });
     }
-
 } catch (error) {
-    log.error(`❌ CRITICAL: ${error.message}`);
+    log.error(`CRITICAL: ${error.message}`);
     log.exception(error, 'Actor failed');
     throw error;
 } finally {

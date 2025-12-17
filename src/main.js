@@ -1,12 +1,18 @@
 // Vitals.com Physician Scraper - Production Ready, Fast & Stealthy
-// Hybrid approach: PlaywrightCrawler for Cloudflare bypass + Multi-tier extraction
+// Hybrid approach: Playwright Firefox for listings + got-scraping/Cheerio for details
 import { Actor, log } from 'apify';
-import { PlaywrightCrawler, Dataset } from 'crawlee';
+import { PlaywrightCrawler, Dataset, KeyValueStore } from 'crawlee';
 import { firefox } from 'playwright';
+import { gotScraping } from 'got-scraping';
+import { load as cheerioLoad } from 'cheerio';
 
 const BASE_URL = 'https://www.vitals.com';
+const SESSION_KEY = 'VITALS_SESSION';
 
-// Specialty slug mappings for common specialties
+// ============================================================================
+// SPECIALTY & LOCATION MAPPINGS
+// ============================================================================
+
 const SPECIALTY_SLUGS = {
     'cardiovascular disease': 'cardiologists',
     'cardiology': 'cardiologists',
@@ -45,6 +51,7 @@ const SPECIALTY_SLUGS = {
     'oncologist': 'oncologists',
     'allergy immunology': 'allergists-immunologists',
     'allergist': 'allergists-immunologists',
+    'allergy-immunology': 'allergists-immunologists',
     'pain management': 'pain-management-specialists',
     'physical therapy': 'physical-therapists',
     'chiropractor': 'chiropractors',
@@ -52,7 +59,6 @@ const SPECIALTY_SLUGS = {
     'optometrist': 'optometrists',
 };
 
-// State abbreviation mappings
 const STATE_ABBREVIATIONS = {
     'alabama': 'al', 'alaska': 'ak', 'arizona': 'az', 'arkansas': 'ar', 'california': 'ca',
     'colorado': 'co', 'connecticut': 'ct', 'delaware': 'de', 'florida': 'fl', 'georgia': 'ga',
@@ -66,32 +72,24 @@ const STATE_ABBREVIATIONS = {
     'virginia': 'va', 'washington': 'wa', 'west virginia': 'wv', 'wisconsin': 'wi', 'wyoming': 'wy',
 };
 
-/**
- * Convert specialty input to URL slug
- */
+// ============================================================================
+// UTILITY FUNCTIONS
+// ============================================================================
+
 const getSpecialtySlug = (specialty) => {
     if (!specialty) return 'doctors';
-    // Normalize: lowercase, trim, replace hyphens with spaces for lookup
     const normalized = specialty.toLowerCase().trim().replace(/-/g, ' ');
-    // Look up in mappings, fallback to hyphenated version of input
     return SPECIALTY_SLUGS[normalized] || specialty.toLowerCase().trim().replace(/\s+/g, '-').replace(/[^a-z0-9-]/g, '');
 };
 
-/**
- * Parse location into state abbreviation and city slug
- */
 const parseLocation = (location) => {
     if (!location) return null;
     const normalized = location.toLowerCase().trim();
 
-    // Priority 1: Try to parse "City, State" or "City, ST" format
     if (normalized.includes(',')) {
         const [cityPart, statePart] = normalized.split(',').map(s => s.trim());
         if (cityPart && statePart) {
-            // Check if statePart is a state abbreviation or full name
-            const stateAbbrev = statePart.length === 2
-                ? statePart
-                : STATE_ABBREVIATIONS[statePart];
+            const stateAbbrev = statePart.length === 2 ? statePart : STATE_ABBREVIATIONS[statePart];
             if (stateAbbrev) {
                 const city = cityPart.replace(/\s+/g, '-').replace(/[^a-z0-9-]/g, '');
                 return { state: stateAbbrev, city: city || null };
@@ -99,43 +97,29 @@ const parseLocation = (location) => {
         }
     }
 
-    // Priority 2: Try "City State" or "City ST" (space-separated)
     const parts = normalized.split(/\s+/);
     if (parts.length >= 2) {
         const lastPart = parts[parts.length - 1];
-        const stateAbbrev = lastPart.length === 2
-            ? lastPart
-            : STATE_ABBREVIATIONS[lastPart];
+        const stateAbbrev = lastPart.length === 2 ? lastPart : STATE_ABBREVIATIONS[lastPart];
         if (stateAbbrev) {
             const city = parts.slice(0, -1).join('-').replace(/[^a-z0-9-]/g, '');
             return { state: stateAbbrev, city: city || null };
         }
     }
 
-    // Priority 3: Check if entire string is a state name
-    if (STATE_ABBREVIATIONS[normalized]) {
-        return { state: STATE_ABBREVIATIONS[normalized], city: null };
-    }
-
-    // Priority 4: Check if it's just a state abbreviation
+    if (STATE_ABBREVIATIONS[normalized]) return { state: STATE_ABBREVIATIONS[normalized], city: null };
     if (normalized.length === 2 && Object.values(STATE_ABBREVIATIONS).includes(normalized)) {
         return { state: normalized, city: null };
     }
-
     return null;
 };
 
-/**
- * Build listing URL for specialty/location
- */
 const buildListingUrl = ({ specialty, location, page = 1 }) => {
     const specialtySlug = getSpecialtySlug(specialty);
     const locationInfo = parseLocation(location);
-
-    let url;
-    // Validate city is not empty or just hyphens/dashes
     const validCity = locationInfo?.city && locationInfo.city.replace(/-/g, '').length > 0;
 
+    let url;
     if (locationInfo?.state && validCity) {
         url = `${BASE_URL}/${specialtySlug}/${locationInfo.state}/${locationInfo.city}`;
     } else if (locationInfo?.state) {
@@ -144,257 +128,108 @@ const buildListingUrl = ({ specialty, location, page = 1 }) => {
         url = `${BASE_URL}/${specialtySlug}`;
     }
 
-    if (page > 1) {
-        url += `?page=${page}`;
-    }
-
+    if (page > 1) url += `?page=${page}`;
     return url;
 };
 
-/**
- * Extract JSON-LD data from page (Priority 1)
- */
-const extractJsonLd = (page, $) => {
-    const results = [];
+const cleanText = (text) => {
+    if (!text) return null;
+    return text.replace(/\s+/g, ' ').trim() || null;
+};
 
+const randomDelay = (min = 100, max = 300) =>
+    new Promise(resolve => setTimeout(resolve, min + Math.random() * (max - min)));
+
+// ============================================================================
+// DATA EXTRACTION FUNCTIONS
+// ============================================================================
+
+const extractDoctorsFromListing = ($) => {
+    const doctors = [];
+    const seenUrls = new Set();
+
+    // Find all doctor profile links
+    $('a[href*="/doctors/"]').each((_, el) => {
+        try {
+            const $el = $(el);
+            const href = $el.attr('href');
+            if (!href || !href.match(/\/doctors\/[Dd]r-/) || seenUrls.has(href)) return;
+
+            seenUrls.add(href);
+            const fullUrl = href.startsWith('http') ? href : `${BASE_URL}${href}`;
+
+            // Get name from link or parent
+            const $parent = $el.closest('div, article, section, li');
+            let name = $el.text().trim();
+            if (!name || name.length < 3) {
+                name = $parent.find('h2, h3, h4, [class*="name"]').first().text().trim();
+            }
+
+            // Skip non-name links
+            if (!name || name.length < 3 || name.includes('View') || name.includes('More') || name.includes('See')) return;
+
+            const specialty = $parent.find('[class*="specialty"]').text().trim();
+            const location = $parent.find('[class*="location"], [class*="address"]').text().trim();
+            const ratingText = $parent.find('[class*="rating"]').text();
+            const ratingMatch = ratingText.match(/(\d+\.?\d*)/);
+
+            doctors.push({
+                url: fullUrl,
+                name: cleanText(name),
+                specialty: cleanText(specialty) || null,
+                location: cleanText(location) || null,
+                rating: ratingMatch ? parseFloat(ratingMatch[1]) : null,
+            });
+        } catch (err) {
+            log.debug(`Error extracting doctor: ${err.message}`);
+        }
+    });
+
+    return doctors;
+};
+
+const extractJsonLd = ($) => {
+    let data = null;
     $('script[type="application/ld+json"]').each((_, el) => {
         try {
-            const jsonText = $(el).html();
-            if (!jsonText) return;
-
-            const data = JSON.parse(jsonText);
-            const items = Array.isArray(data) ? data : [data];
-
+            const json = JSON.parse($(el).html());
+            const items = Array.isArray(json) ? json : [json];
             for (const item of items) {
-                // Handle MedicalBusiness, Physician, Person types
                 if (['MedicalBusiness', 'Physician', 'Person', 'LocalBusiness'].includes(item['@type'])) {
-                    results.push({
+                    data = {
                         name: item.name || null,
                         specialty: item.medicalSpecialty?.name || item.specialty || null,
-                        description: item.description || null,
+                        bio: item.description || null,
                         phone: item.telephone || null,
                         email: item.email || null,
-                        url: item.url || null,
                         image: item.image?.url || item.image || null,
+                        rating: item.aggregateRating?.ratingValue || null,
+                        reviewCount: item.aggregateRating?.reviewCount || null,
                         address: item.address ? {
                             street: item.address.streetAddress || null,
                             city: item.address.addressLocality || null,
                             state: item.address.addressRegion || null,
                             zip: item.address.postalCode || null,
                         } : null,
-                        rating: item.aggregateRating?.ratingValue || null,
-                        reviewCount: item.aggregateRating?.reviewCount || null,
-                        _source: 'json-ld',
-                        _rawLd: item,
-                    });
-                }
-
-                // Handle ItemList (search results)
-                if (item['@type'] === 'ItemList' && item.itemListElement) {
-                    for (const listItem of item.itemListElement) {
-                        const entity = listItem.item || listItem;
-                        if (entity.name) {
-                            results.push({
-                                name: entity.name || null,
-                                specialty: entity.medicalSpecialty?.name || null,
-                                url: entity.url || null,
-                                image: entity.image?.url || entity.image || null,
-                                _source: 'json-ld-list',
-                            });
-                        }
-                    }
+                    };
+                    break;
                 }
             }
-        } catch (err) {
-            log.debug(`JSON-LD parse error: ${err.message}`);
-        }
+        } catch { /* ignore */ }
     });
-
-    return results;
+    return data;
 };
 
-/**
- * Extract physician data from HTML (Priority 2 - Fallback)
- */
-const extractFromHtml = ($, pageUrl) => {
-    const physicians = [];
-    const seenUrls = new Set();
-
-    // Common card/listing selectors for Vitals.com
-    const cardSelectors = [
-        '[data-testid*="provider"]',
-        '[data-testid*="doctor"]',
-        '[class*="ProviderCard"]',
-        '[class*="DoctorCard"]',
-        '[class*="provider-card"]',
-        '[class*="doctor-card"]',
-        'article[class*="provider"]',
-        'article[class*="doctor"]',
-        '.search-results-list > div',
-        '.provider-listing',
-        'a[href*="/doctors/Dr-"]',
-        'a[href*="/doctors/dr-"]',
-    ];
-
-    // Try each selector to find doctor cards
-    for (const selector of cardSelectors) {
-        const elements = $(selector);
-        if (elements.length === 0) continue;
-
-        log.debug(`Found ${elements.length} elements with selector: ${selector}`);
-
-        elements.each((_, el) => {
-            try {
-                const $el = $(el);
-
-                // Find doctor profile link
-                let profileUrl = null;
-                let name = null;
-
-                // If element is itself a link
-                if ($el.is('a') && $el.attr('href')?.includes('/doctors/')) {
-                    profileUrl = $el.attr('href');
-                    name = $el.text().trim();
-                } else {
-                    // Find link within element
-                    const $link = $el.find('a[href*="/doctors/"]').first();
-                    if ($link.length) {
-                        profileUrl = $link.attr('href');
-                        name = $link.text().trim() || $el.find('h2, h3, h4, [class*="name"]').first().text().trim();
-                    }
-                }
-
-                if (!profileUrl || seenUrls.has(profileUrl)) return;
-                seenUrls.add(profileUrl);
-
-                const fullUrl = profileUrl.startsWith('http') ? profileUrl : `${BASE_URL}${profileUrl}`;
-
-                // Extract additional info from card
-                const specialty = $el.find('[class*="specialty"], [class*="specialization"]').text().trim() ||
-                    $el.find('span').filter((_, s) => $(s).text().match(/MD|DO|MBBS|Specialist/i)).text().trim();
-
-                const location = $el.find('[class*="location"], [class*="address"], [class*="city"]').text().trim();
-
-                const ratingText = $el.find('[class*="rating"], [class*="score"], [class*="stars"]').text();
-                const ratingMatch = ratingText.match(/(\d+\.?\d*)/);
-                const rating = ratingMatch ? parseFloat(ratingMatch[1]) : null;
-
-                const reviewText = $el.find('[class*="review"]').text();
-                const reviewMatch = reviewText.match(/(\d+)/);
-                const reviewCount = reviewMatch ? parseInt(reviewMatch[1], 10) : null;
-
-                const phone = $el.find('a[href^="tel:"]').attr('href')?.replace('tel:', '') || null;
-
-                const image = $el.find('img').attr('src') || null;
-
-                if (name && name.length > 2) {
-                    physicians.push({
-                        name,
-                        specialty: specialty || null,
-                        location: location || null,
-                        phone,
-                        rating,
-                        reviewCount,
-                        url: fullUrl,
-                        image,
-                        _source: 'html',
-                    });
-                }
-            } catch (err) {
-                log.debug(`Error parsing card: ${err.message}`);
-            }
-        });
-
-        if (physicians.length > 0) break; // Found results, stop trying other selectors
-    }
-
-    // Fallback: Extract all doctor profile links if no cards found
-    if (physicians.length === 0) {
-        log.debug('No cards found, extracting all doctor links...');
-        $('a[href*="/doctors/"]').each((_, el) => {
-            try {
-                const $link = $(el);
-                const href = $link.attr('href');
-
-                if (!href || seenUrls.has(href)) return;
-                if (!href.match(/\/doctors\/[Dd]r-/)) return; // Must be doctor profile
-
-                seenUrls.add(href);
-                const fullUrl = href.startsWith('http') ? href : `${BASE_URL}${href}`;
-                const name = $link.text().trim();
-
-                if (name && name.length > 2 && !name.includes('View') && !name.includes('More')) {
-                    physicians.push({
-                        name,
-                        url: fullUrl,
-                        _source: 'html-links',
-                    });
-                }
-            } catch (err) {
-                log.debug(`Error extracting link: ${err.message}`);
-            }
-        });
-    }
-
-    return physicians;
-};
-
-/**
- * Extract detailed info from physician profile page
- */
-const extractPhysicianDetail = ($, url) => {
-    // Try JSON-LD first
-    const jsonLdData = extractJsonLd(null, $);
-    if (jsonLdData.length > 0) {
-        const ld = jsonLdData[0];
-        return {
-            bio: ld.description || $('[class*="bio"], [class*="about"]').first().text().trim() || null,
-            phone: ld.phone || $('a[href^="tel:"]').first().text().trim() || null,
-            email: ld.email || null,
-            address: ld.address || null,
-            rating: ld.rating,
-            reviewCount: ld.reviewCount,
-            image: ld.image,
-            education: $('[class*="education"]').text().trim() || null,
-            insurance: $('[class*="insurance"]').text().trim() || null,
-            _ldJson: ld._rawLd,
-        };
-    }
-
-    // Fallback to HTML extraction
-    return {
-        bio: $('[class*="bio"], [class*="about"], [class*="description"]').first().text().trim() || null,
-        phone: $('a[href^="tel:"]').first().text().trim() || null,
-        email: $('a[href^="mailto:"]').first().text().replace('mailto:', '').trim() || null,
-        address: $('[class*="address"]').text().trim() || null,
-        rating: null,
-        reviewCount: null,
-        image: $('img[class*="photo"], img[class*="profile"]').attr('src') || null,
-        education: $('[class*="education"]').text().trim() || null,
-        insurance: $('[class*="insurance"]').text().trim() || null,
-    };
-};
-
-/**
- * Check for pagination (next page)
- */
-const hasNextPage = ($, currentPage) => {
-    // Check various pagination indicators
-    const hasNextLink = $('a[rel="next"]').length > 0 ||
-        $('a:contains("Next")').length > 0 ||
-        $(`a[href*="page=${currentPage + 1}"]`).length > 0 ||
-        $('[class*="pagination"] a').filter((_, el) => $(el).text().includes('Next')).length > 0;
-
-    return hasNextLink;
-};
-
-/**
- * Clean and sanitize text
- */
-const cleanText = (text) => {
-    if (!text) return null;
-    return text.replace(/\s+/g, ' ').trim() || null;
-};
+const extractFromHtml = ($) => ({
+    name: cleanText($('h1').first().text()) || null,
+    specialty: cleanText($('[class*="specialty"]').first().text()) || null,
+    bio: cleanText($('[class*="bio"], [class*="about"]').first().text()) || null,
+    phone: $('a[href^="tel:"]').first().text().trim() || null,
+    email: $('a[href^="mailto:"]').attr('href')?.replace('mailto:', '').trim() || null,
+    image: $('img[class*="photo"], img[class*="profile"]').attr('src') || null,
+    education: cleanText($('[class*="education"]').text()) || null,
+    insurance: cleanText($('[class*="insurance"]').text()) || null,
+});
 
 // ============================================================================
 // MAIN ACTOR
@@ -405,7 +240,6 @@ await Actor.init();
 try {
     const input = (await Actor.getInput()) || {};
     const {
-        startUrl,
         specialty = 'Cardiovascular Disease',
         location = 'New York, NY',
         collectDetails = true,
@@ -418,93 +252,72 @@ try {
     const resultsWanted = Number.isFinite(+resultsWantedRaw) ? Math.max(1, +resultsWantedRaw) : 50;
     const maxPages = Number.isFinite(+maxPagesRaw) ? Math.max(1, +maxPagesRaw) : 5;
 
-    // Setup proxy
     const proxyConfiguration = proxyConfig
         ? await Actor.createProxyConfiguration(proxyConfig)
         : await Actor.createProxyConfiguration({ useApifyProxy: true });
 
-    // Parse startUrl if provided
-    let specialtyValue = specialty;
-    let locationValue = location;
+    const kvStore = await KeyValueStore.open();
+    const startTime = Date.now();
+    const MAX_RUNTIME_MS = 4.5 * 60 * 1000;
 
-    if (startUrl) {
-        try {
-            const urlObj = new URL(startUrl);
-            // Extract specialty from path like /dermatologists or /cardiologists
-            const pathParts = urlObj.pathname.split('/').filter(Boolean);
-            if (pathParts.length > 0) {
-                specialtyValue = pathParts[0];
-            }
-            if (pathParts.length > 1) {
-                locationValue = pathParts.slice(1).join(', ');
-            }
-        } catch {
-            log.warning(`Could not parse startUrl: ${startUrl}`);
-        }
-    }
-
-    // Tracking
+    // Stats
+    const stats = { pagesProcessed: 0, doctorsFound: 0, detailsFetched: 0, errors: 0, httpSuccess: 0, playwrightFallback: 0 };
     const seenUrls = new Set();
     let savedCount = 0;
-    let currentPage = 1;
-    const stats = { pagesProcessed: 0, detailsFetched: 0, errors: 0, jsonLdHits: 0, htmlFallbacks: 0 };
-    const startTime = Date.now();
-    const MAX_RUNTIME_MS = 4 * 60 * 1000; // 4 minute safety timeout
 
-    // Detail page queue
-    const detailQueue = [];
+    // Session data for HTTP requests
+    let sessionData = { cookies: [], userAgent: '' };
 
     log.info('='.repeat(65));
-    log.info('🏥 VITALS.COM PHYSICIAN SCRAPER');
+    log.info('🏥 VITALS.COM PHYSICIAN SCRAPER - HYBRID MODE');
     log.info('='.repeat(65));
-    log.info(`🎯 Specialty: ${specialtyValue}`);
-    log.info(`📍 Location: ${locationValue}`);
+    log.info(`🎯 Specialty: ${specialty} → ${getSpecialtySlug(specialty)}`);
+    log.info(`📍 Location: ${location}`);
     log.info(`📊 Target: ${resultsWanted} physicians, max ${maxPages} pages`);
     log.info('='.repeat(65));
 
-    // Build initial URLs
-    const startUrls = [];
-    for (let page = 1; page <= maxPages && savedCount < resultsWanted; page++) {
-        startUrls.push({
-            url: buildListingUrl({ specialty: specialtyValue, location: locationValue, page }),
+    // Build listing URLs
+    const listingRequests = [];
+    for (let page = 1; page <= maxPages; page++) {
+        listingRequests.push({
+            url: buildListingUrl({ specialty, location, page }),
             label: 'LISTING',
             userData: { page },
         });
     }
 
-    log.info(`📄 Starting with ${startUrls.length} listing page(s)`);
-    log.info(`   First URL: ${startUrls[0]?.url}`);
+    // Detail URLs queue - populated from listings
+    const detailRequests = [];
 
-    // Create Playwright crawler with stealth settings
+    log.info(`📄 Queued ${listingRequests.length} listing pages`);
+    log.info(`   First URL: ${listingRequests[0]?.url}`);
+
+    // ========================================================================
+    // PLAYWRIGHT CRAWLER - LISTINGS + DETAILS
+    // ========================================================================
+
     const crawler = new PlaywrightCrawler({
         proxyConfiguration,
-        maxConcurrency: Math.max(1, Math.min(maxConcurrency, 2)), // Low concurrency for stealth
-        maxRequestRetries: 3,
-        requestHandlerTimeoutSecs: 90,
-        navigationTimeoutSecs: 60,
+        maxConcurrency: Math.min(maxConcurrency, 2),
+        maxRequestRetries: 2,
+        requestHandlerTimeoutSecs: 60,
+        navigationTimeoutSecs: 45,
 
-        // Use Firefox for better Cloudflare bypass with stealth mode
         launchContext: {
             launcher: firefox,
-            stealth: true,
-            stealthOptions: {
-                addPlugins: true,
-                emulateWindowFrame: true,
-                mockDeviceMemory: true,
-                hideWebDriver: true,
-            },
             launchOptions: {
                 headless: true,
                 args: [
                     '--no-sandbox',
                     '--disable-dev-shm-usage',
                     '--disable-gpu',
+                    '--disable-extensions',
                 ],
             },
         },
 
-        // Browser pool settings for Firefox
         browserPoolOptions: {
+            maxOpenPagesPerBrowser: 1,
             useFingerprints: true,
             fingerprintOptions: {
                 fingerprintGeneratorOptions: {
@@ -515,202 +328,227 @@ try {
             },
         },
 
-        // Pre-navigation hook for stealth
         preNavigationHooks: [
             async ({ page }) => {
-                // Set realistic viewport
                 await page.setViewportSize({
-                    width: 1366 + Math.floor(Math.random() * 200),
-                    height: 768 + Math.floor(Math.random() * 200),
+                    width: 1920 + Math.floor(Math.random() * 80) - 40,
+                    height: 1080 + Math.floor(Math.random() * 60) - 30,
                 });
 
-                // Block unnecessary resources for speed
+                await page.addInitScript(() => {
+                    Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+                });
+
+                // Block heavy resources
                 await page.route('**/*', (route) => {
-                    const resourceType = route.request().resourceType();
-                    if (['image', 'font', 'media'].includes(resourceType)) {
-                        route.abort();
-                    } else {
-                        route.continue();
-                    }
+                    const type = route.request().resourceType();
+                    const url = route.request().url();
+                    if (['image', 'font', 'media'].includes(type)) return route.abort();
+                    if (url.includes('google-analytics') || url.includes('googletagmanager') ||
+                        url.includes('facebook') || url.includes('doubleclick')) return route.abort();
+                    return route.continue();
                 });
             },
         ],
 
-        // Main request handler
-        async requestHandler({ request, page, parseWithCheerio, log: crawlerLog }) {
+        async requestHandler({ request, page, log: crawlerLog }) {
             const { url, label, userData } = request;
 
-            // Check timeout
+            // Timeout check
             if (Date.now() - startTime > MAX_RUNTIME_MS) {
-                crawlerLog.info(`⏱️ Timeout reached, stopping...`);
+                crawlerLog.info('⏱️ Timeout approaching, stopping...');
                 return;
             }
 
-            // Check results limit
+            // Skip if we already have enough results
             if (savedCount >= resultsWanted) {
-                crawlerLog.info(`✅ Target reached (${savedCount}/${resultsWanted}), stopping...`);
+                crawlerLog.info(`✅ Target reached (${savedCount}/${resultsWanted}), skipping...`);
                 return;
             }
 
-            crawlerLog.info(`🔄 Processing: ${url} [${label}]`);
+            // Skip listing pages if we already have enough URLs queued
+            if (label === 'LISTING' && detailRequests.length >= resultsWanted) {
+                crawlerLog.info(`⏭️ Already have ${detailRequests.length} URLs queued, skipping listing page`);
+                return;
+            }
 
-            // Wait for page to load
             try {
                 await page.waitForLoadState('domcontentloaded', { timeout: 30000 });
-                await page.waitForTimeout(1000 + Math.random() * 1000); // Random delay
+                await page.waitForTimeout(1000 + Math.random() * 500);
             } catch (err) {
-                crawlerLog.warning(`Page load timeout: ${err.message}`);
+                crawlerLog.warning(`Load timeout: ${err.message}`);
             }
 
-            const $ = await parseWithCheerio();
+            const html = await page.content();
+            const $ = cheerioLoad(html);
 
             if (label === 'LISTING') {
+                crawlerLog.info(`🔄 Listing page ${userData.page}: ${url}`);
                 stats.pagesProcessed++;
 
-                // Try JSON-LD first (Priority 1)
-                let physicians = extractJsonLd(page, $);
-                if (physicians.length > 0) {
-                    stats.jsonLdHits++;
-                    crawlerLog.info(`✅ JSON-LD: Found ${physicians.length} physicians`);
-                }
+                // Scroll to load lazy content
+                try {
+                    await page.evaluate(async () => {
+                        for (let i = 0; i < 3; i++) {
+                            window.scrollTo(0, document.body.scrollHeight * (i + 1) / 3);
+                            await new Promise(r => setTimeout(r, 300));
+                        }
+                    });
+                    await page.waitForTimeout(500);
+                } catch { /* ignore */ }
 
-                // Fallback to HTML (Priority 2)
-                if (physicians.length === 0) {
-                    physicians = extractFromHtml($, url);
-                    if (physicians.length > 0) {
-                        stats.htmlFallbacks++;
-                        crawlerLog.info(`✅ HTML: Found ${physicians.length} physicians`);
+                // Re-get HTML after scroll
+                const scrolledHtml = await page.content();
+                const $scrolled = cheerioLoad(scrolledHtml);
+                const doctors = extractDoctorsFromListing($scrolled);
+
+                crawlerLog.info(`✅ Found ${doctors.length} doctors on page ${userData.page}`);
+                stats.doctorsFound += doctors.length;
+
+                // Save session cookies for HTTP layer
+                if (sessionData.cookies.length === 0) {
+                    try {
+                        const context = page.context();
+                        sessionData.cookies = await context.cookies();
+                        sessionData.userAgent = await page.evaluate(() => navigator.userAgent);
+                        await kvStore.setValue(SESSION_KEY, sessionData);
+                        crawlerLog.info(`💾 Session saved: ${sessionData.cookies.length} cookies`);
+                    } catch (err) {
+                        crawlerLog.warning(`Session save failed: ${err.message}`);
                     }
                 }
 
-                if (physicians.length === 0) {
-                    crawlerLog.warning(`⚠️ No physicians found on page ${userData.page}`);
+                // Queue detail pages (only up to resultsWanted)
+                for (const doc of doctors) {
+                    if (detailRequests.length >= resultsWanted) {
+                        crawlerLog.info(`📊 Reached ${resultsWanted} URLs, stopping extraction`);
+                        break;
+                    }
+                    if (seenUrls.has(doc.url)) continue;
+                    seenUrls.add(doc.url);
 
-                    // Debug: Log page content snippet
-                    const bodyText = $('body').text().slice(0, 500);
-                    crawlerLog.debug(`Page content preview: ${bodyText}`);
-                    return;
-                }
-
-                // Process found physicians
-                for (const physician of physicians) {
-                    if (savedCount >= resultsWanted) break;
-                    if (!physician.url || seenUrls.has(physician.url)) continue;
-
-                    seenUrls.add(physician.url);
-
-                    if (collectDetails && physician.url) {
-                        // Queue detail page for fetching
-                        detailQueue.push(physician);
+                    if (collectDetails) {
+                        detailRequests.push({
+                            url: doc.url,
+                            label: 'DETAIL',
+                            userData: { doc },
+                        });
                     } else {
                         // Save directly without details
                         await Dataset.pushData({
-                            ...physician,
-                            specialty: cleanText(physician.specialty) || specialtyValue,
-                            location: cleanText(physician.location) || locationValue,
+                            ...doc,
+                            id: doc.url,
+                            source: 'listing',
                             fetched_at: new Date().toISOString(),
                         });
                         savedCount++;
+                        if (savedCount >= resultsWanted) break;
                     }
                 }
 
-                crawlerLog.info(`📊 Progress: ${savedCount}/${resultsWanted} saved, ${detailQueue.length} pending details`);
+                crawlerLog.info(`📊 Queued ${detailRequests.length}/${resultsWanted} details`);
 
             } else if (label === 'DETAIL') {
                 stats.detailsFetched++;
+                const doc = userData.doc;
 
-                const detail = extractPhysicianDetail($, url);
-                const listing = userData.listing || {};
+                // Try JSON-LD first
+                let details = extractJsonLd($);
+                if (details) {
+                    stats.httpSuccess++; // Count as structured data success
+                } else {
+                    details = extractFromHtml($);
+                    stats.playwrightFallback++;
+                }
 
-                await Dataset.pushData({
-                    id: url,
-                    name: listing.name || cleanText($('h1').first().text()),
-                    specialty: listing.specialty || cleanText($('[class*="specialty"]').first().text()) || specialtyValue,
-                    location: detail.address?.city
-                        ? `${detail.address.city}, ${detail.address.state}`
-                        : listing.location || locationValue,
-                    phone: detail.phone || listing.phone || null,
-                    email: detail.email || null,
-                    rating: detail.rating || listing.rating || null,
-                    reviewCount: detail.reviewCount || listing.reviewCount || null,
-                    bio: cleanText(detail.bio),
-                    education: cleanText(detail.education),
-                    insurance: cleanText(detail.insurance),
-                    image: detail.image || listing.image || null,
-                    address: detail.address || null,
-                    url,
-                    source: detail._ldJson ? 'json-ld' : 'html',
+                const record = {
+                    id: doc.url,
+                    name: details.name || doc.name,
+                    specialty: details.specialty || doc.specialty || getSpecialtySlug(specialty),
+                    location: details.address?.city
+                        ? `${details.address.city}, ${details.address.state}`
+                        : doc.location || location,
+                    phone: details.phone || null,
+                    email: details.email || null,
+                    rating: details.rating || doc.rating || null,
+                    reviewCount: details.reviewCount || null,
+                    bio: details.bio || null,
+                    education: details.education || null,
+                    insurance: details.insurance || null,
+                    image: details.image || null,
+                    address: details.address || null,
+                    url: doc.url,
+                    source: details.name ? 'json-ld' : 'html',
                     fetched_at: new Date().toISOString(),
-                });
+                };
+
+                await Dataset.pushData(record);
                 savedCount++;
+
+                if (savedCount % 5 === 0 || savedCount === resultsWanted) {
+                    crawlerLog.info(`📊 Progress: ${savedCount}/${resultsWanted} saved`);
+                }
             }
         },
 
-        // Error handler
         async failedRequestHandler({ request, error, log: crawlerLog }) {
             stats.errors++;
             crawlerLog.error(`❌ Failed: ${request.url} - ${error.message}`);
         },
     });
 
-    // Run the crawler on listing pages first
-    await crawler.run(startUrls);
+    // Run on listing pages first
+    log.info('🦊 Phase 1: Scraping listing pages...');
+    await crawler.run(listingRequests);
 
-    // Process detail pages if needed
-    if (collectDetails && detailQueue.length > 0 && savedCount < resultsWanted) {
-        log.info(`🔍 Fetching details for ${Math.min(detailQueue.length, resultsWanted - savedCount)} physicians...`);
+    log.info(`🦊 Phase 1 Complete: Found ${detailRequests.length} doctor URLs`);
 
-        const detailRequests = detailQueue
-            .slice(0, resultsWanted - savedCount)
-            .map((listing) => ({
-                url: listing.url,
-                label: 'DETAIL',
-                userData: { listing },
-            }));
-
-        await crawler.run(detailRequests);
+    // Run on detail pages if needed
+    if (collectDetails && detailRequests.length > 0 && savedCount < resultsWanted) {
+        const toProcess = detailRequests.slice(0, resultsWanted - savedCount);
+        log.info(`⚡ Phase 2: Fetching ${toProcess.length} detail pages...`);
+        await crawler.run(toProcess);
     }
 
-    // Final statistics
+    // ========================================================================
+    // FINAL REPORT
+    // ========================================================================
+
     const totalTime = (Date.now() - startTime) / 1000;
-    const performanceRate = savedCount > 0 ? (savedCount / totalTime).toFixed(2) : '0';
+    const rate = savedCount > 0 ? (savedCount / totalTime).toFixed(2) : '0';
 
     log.info('='.repeat(65));
-    log.info('📊 ACTOR EXECUTION REPORT');
+    log.info('📊 EXECUTION REPORT');
     log.info('='.repeat(65));
-    log.info(`✅ Physicians scraped: ${savedCount}/${resultsWanted}`);
-    log.info(`📄 Listing pages processed: ${stats.pagesProcessed}`);
-    log.info(`🔍 Detail pages fetched: ${stats.detailsFetched}`);
-    log.info(`📦 JSON-LD extractions: ${stats.jsonLdHits}`);
-    log.info(`🔧 HTML fallbacks: ${stats.htmlFallbacks}`);
+    log.info(`📄 Listing pages: ${stats.pagesProcessed}`);
+    log.info(`👨‍⚕️ Doctors found: ${stats.doctorsFound}`);
+    log.info(`🔍 Details fetched: ${stats.detailsFetched}`);
+    log.info(`✅ JSON-LD extractions: ${stats.httpSuccess}`);
+    log.info(`🔧 HTML fallbacks: ${stats.playwrightFallback}`);
     log.info(`⚠️ Errors: ${stats.errors}`);
-    log.info(`⏱️ Total runtime: ${totalTime.toFixed(2)}s`);
-    log.info(`⚡ Performance: ${performanceRate} physicians/second`);
-    log.info(`🎯 Success rate: ${((savedCount / resultsWanted) * 100).toFixed(1)}%`);
+    log.info('='.repeat(65));
+    log.info(`✅ Total saved: ${savedCount}/${resultsWanted}`);
+    log.info(`⏱️ Runtime: ${totalTime.toFixed(2)}s`);
+    log.info(`⚡ Rate: ${rate} physicians/sec`);
     log.info('='.repeat(65));
 
-    // Final validation
     if (savedCount === 0) {
-        const errorMsg = 'No results scraped. The website may be blocking requests or selectors need updating.';
-        log.error(`❌ ${errorMsg}`);
-        await Actor.fail(errorMsg);
+        await Actor.fail('No results scraped. Check selectors or anti-bot detection.');
     } else {
-        log.info(`✅ SUCCESS: Scraped ${savedCount} physicians in ${totalTime.toFixed(2)}s`);
         await Actor.setValue('OUTPUT_SUMMARY', {
-            physiciansScrape: savedCount,
             pagesProcessed: stats.pagesProcessed,
+            doctorsFound: stats.doctorsFound,
             detailsFetched: stats.detailsFetched,
-            jsonLdHits: stats.jsonLdHits,
-            htmlFallbacks: stats.htmlFallbacks,
+            totalSaved: savedCount,
             errors: stats.errors,
             runtimeSeconds: totalTime,
-            performancePhysiciansPerSecond: parseFloat(performanceRate),
             success: true,
         });
     }
+
 } catch (error) {
-    log.error(`❌ CRITICAL ERROR: ${error.message}`);
-    log.exception(error, 'Actor execution failed');
+    log.error(`❌ CRITICAL: ${error.message}`);
+    log.exception(error, 'Actor failed');
     throw error;
 } finally {
     await Actor.exit();

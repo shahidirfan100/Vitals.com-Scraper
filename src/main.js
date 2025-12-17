@@ -118,7 +118,10 @@ const STATE_ABBREVIATIONS = {
     'west virginia': 'wv',
     wisconsin: 'wi',
     wyoming: 'wy',
+    'district of columbia': 'dc',
 };
+
+const STATE_CODES = new Set([...Object.values(STATE_ABBREVIATIONS).map((s) => s.toUpperCase()), 'DC']);
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const randomInt = (min, max) => Math.floor(min + Math.random() * (max - min + 1));
@@ -146,6 +149,57 @@ const normalizeUrl = (href) => {
     if (trimmed.startsWith('//')) return `https:${trimmed}`;
     if (trimmed.startsWith('/')) return `${BASE_URL}${trimmed}`;
     return `${BASE_URL}/${trimmed.replace(/^\.?\//, '')}`;
+};
+
+const canonicalizeProfileUrl = (href) => {
+    const full = normalizeUrl(href);
+    if (!full) return null;
+    try {
+        const u = new URL(full);
+        u.hash = '';
+        u.search = '';
+        u.protocol = 'https:';
+        if (u.hostname === 'vitals.com') u.hostname = 'www.vitals.com';
+        u.pathname = u.pathname.replace(/\/+$/, '');
+        return u.toString();
+    } catch {
+        return full.split('#')[0].split('?')[0];
+    }
+};
+
+const extractCityStateFromText = (text) => {
+    const t = cleanText(text);
+    if (!t) return null;
+
+    const re = /([A-Za-z][A-Za-z .'-]{1,60}?),\s*([A-Za-z]{2})\b/g;
+    let m;
+    while ((m = re.exec(t))) {
+        const city = cleanText(m[1]);
+        const state = cleanText(m[2])?.toUpperCase();
+        if (!city || !state) continue;
+        if (!STATE_CODES.has(state)) continue;
+        return `${city}, ${state}`;
+    }
+    return null;
+};
+
+const normalizeLocationText = (text) => extractCityStateFromText(text) || cleanText(text);
+
+const getProfileKeyFromUrl = (href) => {
+    const canonical = canonicalizeProfileUrl(href);
+    if (!canonical) return null;
+    try {
+        const u = new URL(canonical);
+        const parts = u.pathname.split('/').filter(Boolean);
+        if (parts.length >= 2) {
+            const category = parts[0].toLowerCase();
+            const slug = parts[parts.length - 1].toLowerCase();
+            return `${category}:${slug}`;
+        }
+        return canonical.toLowerCase();
+    } catch {
+        return canonical.toLowerCase();
+    }
 };
 
 const isProbablyBlocked = ({ statusCode, body }) => {
@@ -332,6 +386,24 @@ const extractDoctorFromHtml = ($) => {
     };
 };
 
+const extractLocationFromProfileHtml = ($) => {
+    const candidates = [
+        $('[itemprop="address"]').first().text(),
+        $('[itemprop="addressLocality"]').first().text() && `${$('[itemprop="addressLocality"]').first().text()}, ${$('[itemprop="addressRegion"]').first().text()}`,
+        $('[data-testid*="address"], [data-testid*="location"]').first().text(),
+        $('[class*="address"], [class*="location"]').first().text(),
+        $('meta[property="og:title"]').attr('content'),
+        $('title').text(),
+        $('meta[name="description"]').attr('content'),
+    ].filter(Boolean);
+
+    for (const c of candidates) {
+        const loc = extractCityStateFromText(c);
+        if (loc) return loc;
+    }
+    return null;
+};
+
 const extractDoctorsFromListingHtml = ($) => {
     const doctors = [];
     const seen = new Set();
@@ -344,9 +416,10 @@ const extractDoctorsFromListingHtml = ($) => {
         if (!href) return;
         if (!allowedPath.test(href) || excluded.test(href)) return;
 
-        const url = normalizeUrl(href);
-        if (!url || seen.has(url)) return;
-        seen.add(url);
+        const url = canonicalizeProfileUrl(href);
+        const key = url ? getProfileKeyFromUrl(url) : null;
+        if (!url || !key || seen.has(key)) return;
+        seen.add(key);
 
         const $card = $(a).closest('article, li, section, div');
         const nameRaw =
@@ -358,7 +431,8 @@ const extractDoctorsFromListingHtml = ($) => {
         if (/view|more|see/i.test(nameRaw)) return;
 
         const specialty = cleanText($card.find('[class*="specialty"]').first().text());
-        const location = cleanText($card.find('[class*="location"], [class*="address"]').first().text());
+        const locationRaw = cleanText($card.find('[class*="location"], [class*="address"]').first().text());
+        const location = normalizeLocationText(locationRaw) || extractCityStateFromText($card.text()) || null;
         const ratingText = cleanText($card.find('[class*="rating"]').first().text()) || '';
         const ratingMatch = ratingText.match(/(\d+(\.\d+)?)/);
 
@@ -442,7 +516,7 @@ const normalizeDoctorFromJson = (item) => {
         item.canonicalUrl ||
         item.canonical_url ||
         null;
-    const url = normalizeUrl(rawUrl);
+    const url = canonicalizeProfileUrl(rawUrl);
     if (!url) return null;
 
     const name = cleanText(item.name || item.fullName || item.displayName || item.providerName || item.title);
@@ -834,7 +908,9 @@ try {
     }
 
     const listingDoctors = [];
-    const seenProfileUrls = new Set();
+    const seenProfileKeys = new Set();
+    const savedProfileKeys = new Set();
+    const inProgressProfileKeys = new Set();
     let browserBootstrapsUsed = 0;
     const maxBrowserBootstraps = Number.isFinite(+input.maxBrowserBootstraps) ? Math.max(0, +input.maxBrowserBootstraps) : 1;
 
@@ -921,9 +997,12 @@ try {
 
         for (const d of docs) {
             if (!d?.url) continue;
-            if (seenProfileUrls.has(d.url)) continue;
-            seenProfileUrls.add(d.url);
-            listingDoctors.push(d);
+            const canonicalUrl = canonicalizeProfileUrl(d.url);
+            const profileKey = canonicalUrl ? getProfileKeyFromUrl(canonicalUrl) : null;
+            if (!canonicalUrl || !profileKey) continue;
+            if (seenProfileKeys.has(profileKey)) continue;
+            seenProfileKeys.add(profileKey);
+            listingDoctors.push({ ...d, url: canonicalUrl });
             if (listingDoctors.length >= resultsWanted) break;
         }
 
@@ -942,76 +1021,90 @@ try {
         if (stats.saved >= resultsWanted) return;
         stats.detailPages++;
 
-        const url = seed.url;
+        const url = canonicalizeProfileUrl(seed.url);
+        const profileKey = url ? getProfileKeyFromUrl(url) : null;
+        if (!url || !profileKey) return;
+        if (savedProfileKeys.has(profileKey) || inProgressProfileKeys.has(profileKey)) return;
+        inProgressProfileKeys.add(profileKey);
+
         const buildId = httpContext.state.buildId;
         const nextUrl = buildId ? buildNextDataUrl({ buildId, pageUrl: url }) : null;
 
-        if (nextUrl) {
-            try {
-                const res = await httpContext.fetch({
-                    url: nextUrl,
-                    responseType: 'text',
-                    headers: { accept: 'application/json,*/*;q=0.8' },
-                    maxRetries: 2,
-                    timeoutMs: 20000,
-                });
-                const json = typeof res.body === 'string' ? safeJsonParse(res.body) : res.body;
-                if (json) {
-                    const bestObj = extractBestProfileObjectFromJson(json);
-                    const details = normalizeDoctorDetailsFromJson(bestObj);
-                    if (details?.name || details?.phone || details?.address) {
-                        stats.jsonPages++;
-                        const record = {
-                            id: url,
-                            doctorId: details.doctorId || seed.doctorId || null,
-                            name: details.name || seed.name || null,
-                            specialty: details.specialty || seed.specialty || getSpecialtySlug(specialty),
-                            specialties: details.specialties || null,
-                            location: details.location || seed.location || location || null,
-                            phone: details.phone || null,
-                            email: details.email || null,
-                            website: details.website || null,
-                            rating: details.rating ?? seed.rating ?? null,
-                            reviews: details.reviewCount ?? seed.reviewCount ?? null,
-                            education: details.education || null,
-                            certifications: details.certifications || null,
-                            accepted_insurance: details.accepted_insurance || null,
-                            bio: details.bio || null,
-                            image: details.image || null,
-                            address: details.address || null,
-                            url,
-                            source: 'json',
-                            fetched_at: new Date().toISOString(),
-                        };
-                        await Dataset.pushData(record);
-                        stats.saved++;
-                        return;
-                    }
-                }
-            } catch (err) {
-                stats.blocked++;
-                log.debug(`Detail JSON failed: ${err.message}`);
-            }
-        }
-
         try {
+            if (nextUrl) {
+                try {
+                    const res = await httpContext.fetch({
+                        url: nextUrl,
+                        responseType: 'text',
+                        headers: { accept: 'application/json,*/*;q=0.8' },
+                        maxRetries: 2,
+                        timeoutMs: 20000,
+                    });
+                    const json = typeof res.body === 'string' ? safeJsonParse(res.body) : res.body;
+                    if (json) {
+                        const bestObj = extractBestProfileObjectFromJson(json);
+                        const details = normalizeDoctorDetailsFromJson(bestObj);
+                        if (details?.name || details?.phone || details?.address) {
+                            stats.jsonPages++;
+                            const record = {
+                                id: profileKey,
+                                doctorId: details.doctorId || seed.doctorId || null,
+                                name: details.name || seed.name || null,
+                                specialty: details.specialty || seed.specialty || getSpecialtySlug(specialty),
+                                specialties: details.specialties || null,
+                                location: normalizeLocationText(details.location) || normalizeLocationText(seed.location) || normalizeLocationText(location) || null,
+                                phone: details.phone || null,
+                                email: details.email || null,
+                                website: details.website || null,
+                                rating: details.rating ?? seed.rating ?? null,
+                                reviews: details.reviewCount ?? seed.reviewCount ?? null,
+                                education: details.education || null,
+                                certifications: details.certifications || null,
+                                accepted_insurance: details.accepted_insurance || null,
+                                bio: details.bio || null,
+                                image: details.image || null,
+                                address: details.address || null,
+                                url,
+                                source: 'json',
+                                fetched_at: new Date().toISOString(),
+                            };
+                            if (!savedProfileKeys.has(profileKey)) {
+                                await Dataset.pushData(record);
+                                savedProfileKeys.add(profileKey);
+                                stats.saved++;
+                            }
+                            return;
+                        }
+                    }
+                } catch (err) {
+                    stats.blocked++;
+                    log.debug(`Detail JSON failed: ${err.message}`);
+                }
+            }
+
             const res = await httpContext.fetch({ url, responseType: 'text', maxRetries: 2, timeoutMs: 25000 });
             const buildIdFromHtml = extractNextBuildIdFromHtml(res.body);
             if (buildIdFromHtml) httpContext.state.buildId = buildIdFromHtml;
             const $ = cheerioLoad(res.body);
             const jsonLd = extractJsonLd($);
             const html = extractDoctorFromHtml($);
+            const htmlLocation = extractLocationFromProfileHtml($);
             stats.htmlPages++;
 
             const record = {
-                id: url,
+                id: profileKey,
                 doctorId: seed.doctorId || null,
                 name: jsonLd?.name || html.name || seed.name || null,
                 specialty: jsonLd?.specialty || html.specialty || seed.specialty || getSpecialtySlug(specialty),
                 location:
-                    (jsonLd?.address?.city && jsonLd?.address?.state ? `${jsonLd.address.city}, ${jsonLd.address.state}` : null) ||
-                    seed.location ||
-                    location ||
+                    normalizeLocationText(
+                        jsonLd?.address?.city || jsonLd?.address?.state
+                            ? [jsonLd?.address?.city, jsonLd?.address?.state].filter(Boolean).join(', ')
+                            : null,
+                    ) ||
+                    htmlLocation ||
+                    normalizeLocationText(seed.location) ||
+                    normalizeLocationText(location) ||
                     null,
                 phone: jsonLd?.phone || html.phone || null,
                 email: jsonLd?.email || html.email || null,
@@ -1026,17 +1119,35 @@ try {
                 fetched_at: new Date().toISOString(),
             };
 
-            await Dataset.pushData(record);
-            stats.saved++;
+            if (!savedProfileKeys.has(profileKey)) {
+                await Dataset.pushData(record);
+                savedProfileKeys.add(profileKey);
+                stats.saved++;
+            }
         } catch (err) {
             stats.errors++;
             log.warning(`Detail HTML failed: ${url} (${err.message})`);
+        } finally {
+            inProgressProfileKeys.delete(profileKey);
         }
     };
 
     if (!collectDetails) {
         for (const d of listingDoctors.slice(0, resultsWanted)) {
-            await Dataset.pushData({ ...d, id: d.url, source: 'listing', fetched_at: new Date().toISOString() });
+            const url = canonicalizeProfileUrl(d.url);
+            const profileKey = url ? getProfileKeyFromUrl(url) : null;
+            if (!url || !profileKey) continue;
+            if (savedProfileKeys.has(profileKey)) continue;
+
+            await Dataset.pushData({
+                ...d,
+                url,
+                id: profileKey,
+                location: normalizeLocationText(d.location) || null,
+                source: 'listing',
+                fetched_at: new Date().toISOString(),
+            });
+            savedProfileKeys.add(profileKey);
             stats.saved++;
             if (stats.saved >= resultsWanted) break;
         }
